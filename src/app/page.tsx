@@ -20,7 +20,7 @@ import { useState, useMemo, useCallback, useEffect } from "react";
 type TabType = "trueshot" | "crypto";
 
 export default function HomePage() {
-  const [activeTab, setActiveTab] = useState<TabType>("trueshot");
+  const [activeTab, setActiveTab] = useState<TabType>("crypto");
   const [expandedCron, setExpandedCron] = useState<string | null>(null);
   const [selectedDate, setSelectedDate] = useState(() => new Date().toISOString().split("T")[0]);
   const [tradeFilter, setTradeFilter] = useState<'all' | 'paper' | 'real'>('all');
@@ -1042,18 +1042,25 @@ export default function HomePage() {
                 {/* Column 1: Decision Paths */}
                 <div>
                   <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">Decision Paths</h3>
-                  <div className="space-y-1.5">
+                  <div className="space-y-2">
                     {logic.decisionPaths?.map((path: any, i: number) => (
-                      <div key={i} className={`flex items-center gap-2 text-xs ${!path.enabled ? 'opacity-40' : ''}`}>
-                        <button
-                          onClick={() => postConfig({ action: 'togglePath', pathName: path.key, enabled: !path.enabled })}
-                          className={`w-8 h-4 rounded-full relative transition-colors shrink-0 ${
-                            path.enabled ? 'bg-accent-green/60' : 'bg-zinc-700'
-                          }`}
-                        >
-                          <div className="w-3 h-3 rounded-full bg-white absolute top-0.5 transition-all" style={{ left: path.enabled ? '17px' : '2px' }} />
-                        </button>
-                        <span className="text-zinc-200 font-medium whitespace-nowrap">{path.name}</span>
+                      <div key={i} className="flex items-center gap-2 text-xs">
+                        <div className="flex bg-zinc-800 rounded-md overflow-hidden shrink-0">
+                          {(["real", "paper", "disabled"] as const).map((m) => (
+                            <button
+                              key={m}
+                              onClick={() => postConfig({ action: 'setPathMode', pathName: path.key, mode: m })}
+                              className={`px-1.5 py-0.5 text-[10px] font-medium transition-colors ${
+                                path.mode === m
+                                  ? m === 'real' ? 'bg-accent-green/70 text-white' : m === 'paper' ? 'bg-yellow-600/70 text-white' : 'bg-red-600/70 text-white'
+                                  : 'text-zinc-500 hover:text-zinc-300'
+                              }`}
+                            >
+                              {m === "real" ? "💰" : m === "paper" ? "📄" : "⛔"}
+                            </button>
+                          ))}
+                        </div>
+                        <span className={`text-zinc-200 font-medium whitespace-nowrap ${path.mode === 'disabled' ? 'opacity-40' : ''}`}>{path.name}</span>
                         <span className="text-zinc-500 truncate">{path.requirement}</span>
                       </div>
                     ))}

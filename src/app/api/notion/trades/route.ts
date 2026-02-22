@@ -68,7 +68,15 @@ export async function GET(request: Request) {
       const windowEnd = props?.["Window End"]?.date?.start || null;
       
       let profit = 0;
-      if (result === "Win") {
+      if (result === "Adjustment") {
+        // Daily reconciliation adjustment — apply as-is to PnL
+        // Positive adjustment = we have more than Notion thinks (profit)
+        // Negative adjustment = we have less (loss)
+        // The name contains the direction info
+        const isPositive = name.includes('+') || signals.includes('Change +');
+        profit = isPositive ? stake : -stake;
+        pnl += profit;
+      } else if (result === "Win") {
         wins++;
         profit = stake * (1 - odds) / odds;
         pnl += profit;
@@ -160,7 +168,12 @@ export async function GET(request: Request) {
       const mode = signals.includes('💰 REAL') ? 'real' : 'paper';
 
       let profit = 0;
-      if (result === "Win") {
+      if (result === "Adjustment") {
+        const name = props?.Name?.title?.[0]?.plain_text || "";
+        const isPositive = name.includes('+') || signals.includes('Change +');
+        profit = isPositive ? stake : -stake;
+        modeStats.all.pnl += profit; modeStats[mode].pnl += profit;
+      } else if (result === "Win") {
         profit = stake * (1 - odds) / odds;
         modeStats.all.wins++; modeStats[mode].wins++;
         modeStats.all.pnl += profit; modeStats[mode].pnl += profit;

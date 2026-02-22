@@ -58,12 +58,13 @@ export async function GET() {
     // Decision paths — read dynamically from bot thresholds
     const pc = tradingConfig.paths || {};
     const decisionPaths = [
-      { name: "🎰 ARB", key: "arb", requirement: `Price move >${((thresholds?.arbMinPriceMove || 0.003) * 100).toFixed(1)}% + odds lag >${((thresholds?.arbMinDiscrepancy || 0.02) * 100).toFixed(0)}% + conf ≥45%`, type: "bypass", enabled: pc.arb?.enabled !== false },
-      { name: "⚡ Breaking News", key: "breakingNews", requirement: `News detected + ${((thresholds?.breakingNewsMinConfidence || 0.60) * 100).toFixed(0)}%+ conf + price confirmation`, type: "bypass", enabled: pc.breakingNews?.enabled !== false },
-      { name: "Path 1", key: "path1", requirement: `${thresholds?.path1?.categories || 3} signals + ${((thresholds?.minEdge || 0.03) * 100).toFixed(0)}%+ edge (min ${((thresholds?.path1?.confidence || 0.50) * 100).toFixed(0)}% conf)`, type: "signal", enabled: pc.path1?.enabled !== false },
-      { name: "Path 2", key: "path2", requirement: `${thresholds?.path2?.categories || 2} signals + ${((thresholds?.minEdge || 0.03) * 100).toFixed(0)}%+ edge (min ${((thresholds?.path2?.confidence || 0.55) * 100).toFixed(0)}% conf)`, type: "signal", enabled: pc.path2?.enabled !== false },
-      { name: "Path 3", key: "path3", requirement: `${thresholds?.path3?.categories || 1} signal + ${((thresholds?.minEdge || 0.03) * 100).toFixed(0)}%+ edge (min ${((thresholds?.path3?.confidence || 0.65) * 100).toFixed(0)}% conf)`, type: "signal", enabled: pc.path3?.enabled !== false },
-      { name: "🐋 Whale", key: "whale", requirement: "Whale flow agrees with direction + min edge (testing mode)", type: "whale", enabled: pc.whale?.enabled !== false },
+      { name: "🎰 ARB", key: "arb", requirement: `Price move >${((thresholds?.arbMinPriceMove || 0.003) * 100).toFixed(1)}% + odds lag >${((thresholds?.arbMinDiscrepancy || 0.02) * 100).toFixed(0)}% + conf ≥45%`, type: "bypass", enabled: pc.arb?.enabled !== false, mode: pc.arb?.mode || 'paper' },
+      { name: "⚡ Breaking News", key: "breakingNews", requirement: `News detected + ${((thresholds?.breakingNewsMinConfidence || 0.60) * 100).toFixed(0)}%+ conf + price confirmation`, type: "bypass", enabled: pc.breakingNews?.enabled !== false, mode: pc.breakingNews?.mode || 'paper' },
+      { name: "Path 1", key: "path1", requirement: `${thresholds?.path1?.categories || 3} signals + ${((thresholds?.minEdge || 0.03) * 100).toFixed(0)}%+ edge (min ${((thresholds?.path1?.confidence || 0.50) * 100).toFixed(0)}% conf)`, type: "signal", enabled: pc.path1?.enabled !== false, mode: pc.path1?.mode || 'paper' },
+      { name: "Path 2", key: "path2", requirement: `${thresholds?.path2?.categories || 2} signals + ${((thresholds?.minEdge || 0.03) * 100).toFixed(0)}%+ edge (min ${((thresholds?.path2?.confidence || 0.55) * 100).toFixed(0)}% conf)`, type: "signal", enabled: pc.path2?.enabled !== false, mode: pc.path2?.mode || 'paper' },
+      { name: "Path 3", key: "path3", requirement: `${thresholds?.path3?.categories || 1} signal + ${((thresholds?.minEdge || 0.03) * 100).toFixed(0)}%+ edge (min ${((thresholds?.path3?.confidence || 0.65) * 100).toFixed(0)}% conf)`, type: "signal", enabled: pc.path3?.enabled !== false, mode: pc.path3?.mode || 'paper' },
+      { name: "🐋 Whale", key: "whale", requirement: "Whale flow agrees with direction + min edge (testing mode)", type: "whale", enabled: pc.whale?.enabled !== false, mode: pc.whale?.mode || 'paper' },
+      { name: "📅 Macro", key: "macro", requirement: "Economic events + sentiment shift", type: "macro", enabled: pc.macro?.enabled !== false, mode: pc.macro?.mode || 'paper' },
     ];
 
     // Asset weights — set dynamically by macro sentiment bot

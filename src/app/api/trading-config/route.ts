@@ -40,6 +40,22 @@ export async function POST(req: Request) {
       config.params[body.key] = body.value;
     }
 
+    // Set path mode (real/paper/disabled)
+    if (body.action === "setPathMode" && body.pathName && body.mode) {
+      if (!["real", "paper", "disabled"].includes(body.mode)) {
+        return NextResponse.json({ error: "Invalid mode" }, { status: 400 });
+      }
+      if (!config.paths[body.pathName]) {
+        return NextResponse.json({ error: "Unknown path" }, { status: 400 });
+      }
+      config.paths[body.pathName].mode = body.mode;
+      if (body.mode === "disabled") {
+        config.paths[body.pathName].enabled = false;
+      } else {
+        config.paths[body.pathName].enabled = true;
+      }
+    }
+
     // Kill switch
     if (body.action === "killSwitch") {
       config.killSwitch = body.enabled;
