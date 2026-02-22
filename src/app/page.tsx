@@ -147,7 +147,7 @@ export default function HomePage() {
     address: string;
     usdc: number;
     matic: number;
-  }>("/api/wallet-balance", { refreshInterval: 30000 }); // refresh every 30s
+  }>("/api/wallet-balance", { refreshInterval: 10000 }); // live on-chain balance every 10s
 
   // Sync trade filter to current bot mode on initial load
   useEffect(() => {

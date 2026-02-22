@@ -77,7 +77,7 @@ export async function GET() {
         asset,
         weight,
         sentiment: weight > 0.01 ? "bullish" : weight < -0.01 ? "bearish" : "neutral",
-        excluded: (thresholds?.excludedAssets || []).includes(asset),
+        excluded: (tradingConfig.excludedAssets || thresholds?.excludedAssets || []).includes(asset),
         macro: macroResult ? {
           priceTrend: macroResult.price?.trend,
           momentum4h: macroResult.price?.momentum4h,
