@@ -18,13 +18,7 @@ const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 
-// Inject proxy secret header on all requests to our EU proxy
-axios.interceptors.request.use((config) => {
-  if (config.url && config.url.includes('3.254.181.103')) {
-    config.headers['x-proxy-secret'] = 'aab23c2b98dd2ac874f0dd1ec73ca1d2';
-  }
-  return config;
-});
+// (Proxy interceptor removed — using direct CLOB URL now)
 
 // ========== CONFIG ==========
 const REAL_CONFIG = {
@@ -38,7 +32,7 @@ const REAL_CONFIG = {
   maxStakePerTrade: 10,       // $10 max per trade
   maxDailyLoss: 50,           // Stop trading if down $50 in a day
   maxDailyTrades: 30,         // Max trades per day
-  maxConcurrentPositions: 5,  // Max open positions at once
+  maxConcurrentPositions: 20, // Max open positions at once (15-min markets resolve fast)
   
   // Polymarket CLOB (via EU proxy to bypass US geo-block)
   clobUrl: 'https://clob.polymarket.com',  // Direct — server not geo-blocked
@@ -154,6 +148,8 @@ function loadWallet() {
 
 // ========== CLOB CLIENT ==========
 let _cachedApiCreds = null;
+let _cachedApiCredsAt = 0;
+const API_CREDS_TTL = 3600000; // Re-derive every hour
 
 async function createClobClient() {
   const wallet = loadWallet();
@@ -161,13 +157,14 @@ async function createClobClient() {
   
   try {
     // Derive API credentials from wallet (L1 → L2 auth, as per Polymarket docs)
-    if (!_cachedApiCreds) {
+    if (!_cachedApiCreds || (Date.now() - _cachedApiCredsAt > API_CREDS_TTL)) {
       const tempClient = new ClobClient(
         REAL_CONFIG.clobUrl,
         REAL_CONFIG.chainId,
         wallet
       );
       _cachedApiCreds = await tempClient.createOrDeriveApiKey();
+      _cachedApiCredsAt = Date.now();
       console.log('✅ Polymarket API credentials derived from wallet');
     }
     
@@ -435,15 +432,28 @@ async function executeRealTradeTaker(trade) {
       const market = await client.getMarket(trade.conditionId);
       tokenId = trade.direction === 'Up' ? market?.tokens?.[0]?.token_id : market?.tokens?.[1]?.token_id;
     }
-    if (!tokenId) return { success: false, reason: 'Could not resolve token ID — no clobTokenIds or conditionId' };
+    if (!tokenId || tokenId.length < 10) return { success: false, reason: 'Could not resolve token ID — no clobTokenIds or conditionId' };
     
     const stake = Math.min(trade.stake || 10, REAL_CONFIG.maxStakePerTrade);
     
-    console.log(`   💰 TAKER ORDER: ${trade.asset} ${trade.direction} | $${stake} | Token: ${tokenId.slice(0, 12)}...`);
+    // Use exact same approach as working test-order.js:
+    // Limit order at entry odds — fills immediately as taker at market price
+    const rawPrice = trade.entryOdds || 0.5;
+    const price = Math.min(0.99, Math.max(0.01, Math.round(rawPrice * 100) / 100)); // Clamp to valid range & round to tick
+    const size = Math.round(stake / price * 100) / 100; // Shares
     
-    const order = await client.createMarketBuyOrder({
+    if (size <= 0) return { success: false, reason: `Invalid size: ${size} (stake=$${stake}, price=${price})` };
+    
+    console.log(`   💰 ORDER: ${trade.asset} ${trade.direction} | $${stake} @ ${price} | ${size} shares | Token: ${tokenId.slice(0, 12)}...`);
+    
+    const order = await client.createAndPostOrder({
       tokenID: tokenId,
-      amount: stake,
+      price: price,
+      side: 'BUY',
+      size: size,
+      feeRateBps: 1000,
+      tickSize: '0.01',
+      negRisk: false,
     });
     
     state.tradesPlaced++;

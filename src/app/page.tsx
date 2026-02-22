@@ -151,10 +151,10 @@ export default function HomePage() {
 
   // Sync trade filter to current bot mode on initial load
   useEffect(() => {
-    const mode = botData?.bot?.logic?.currentMode;
+    const mode = tradingControl?.mode;
     if (mode === 'real') setTradeFilter('real');
     else if (mode === 'paper') setTradeFilter('paper');
-  }, [botData?.bot?.logic?.currentMode]);
+  }, [tradingControl?.mode]);
 
   // Compute filtered stats based on trade mode filter (all/paper/real)
   const filteredStats = useMemo(() => {
@@ -1007,14 +1007,18 @@ export default function HomePage() {
           {botData?.bot?.logic && (() => {
             const logic = botData.bot.logic;
             const postConfig = async (body: any) => {
+              console.log('[postConfig] sending:', JSON.stringify(body));
               try {
-                await fetch('/api/trading-config', {
+                const res = await fetch('/api/trading-config', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify(body),
                 });
+                console.log('[postConfig] status:', res.status);
                 refreshBotStatus();
-              } catch {}
+              } catch (err) {
+                console.error('[postConfig] error:', err);
+              }
             };
             return (
             <GlassCard index={2} className="mb-4 sm:mb-6">
