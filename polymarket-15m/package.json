@@ -1,0 +1,20 @@
+{
+  "name": "polymarket-15m",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@notionhq/client": "^5.9.0",
+    "@polymarket/clob-client": "^5.2.3",
+    "ethers": "^5.8.0",
+    "node-fetch": "^2.7.0",
+    "technicalindicators": "^3.1.0",
+    "ws": "^8.19.0"
+  }
+}

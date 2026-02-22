@@ -1,0 +1,146 @@
+{
+  "paths": {
+    "arb": {
+      "enabled": true,
+      "label": "🎰 ARB"
+    },
+    "breakingNews": {
+      "enabled": true,
+      "label": "⚡ Breaking News"
+    },
+    "path1": {
+      "enabled": true,
+      "label": "Path 1"
+    },
+    "path2": {
+      "enabled": true,
+      "label": "Path 2"
+    },
+    "path3": {
+      "enabled": true,
+      "label": "Path 3"
+    },
+    "whale": {
+      "enabled": false,
+      "label": "🐋 Whale"
+    }
+  },
+  "killSwitch": false,
+  "stakeTiers": [
+    {
+      "minConf": 0.75,
+      "stake": 15,
+      "label": "75%+"
+    },
+    {
+      "minConf": 0.7,
+      "stake": 10,
+      "label": "70-74%"
+    },
+    {
+      "minConf": 0.6,
+      "stake": 5,
+      "label": "60-69%"
+    },
+    {
+      "minConf": 0.5,
+      "stake": 5,
+      "label": "50-59%"
+    },
+    {
+      "minConf": 0,
+      "stake": 5,
+      "label": "<50%"
+    }
+  ],
+  "params": {
+    "minEdge": 0.03,
+    "minMarketOdds": 0.4,
+    "arbMinDiscrepancy": 0.02,
+    "arbMinPriceMove": 0.003,
+    "arbMinConfidence": 0.45,
+    "breakingNewsMinConfidence": 0.6,
+    "path1Confidence": 0.5,
+    "path1Categories": 3,
+    "path2Confidence": 0.55,
+    "path2Categories": 2,
+    "path3Confidence": 0.65,
+    "path3Categories": 1
+  },
+  "excludedAssets": [
+    "XRP",
+    "SOL"
+  ],
+  "assetWeights": {
+    "BTC": 0,
+    "ETH": 0,
+    "SOL": 0
+  },
+  "macroUpdate": {
+    "timestamp": "2026-02-22T12:01:23.440Z",
+    "results": {
+      "BTC": {
+        "price": {
+          "trend": "neutral",
+          "score": 0.09,
+          "momentum4h": "0.07%",
+          "trend24h": "N/A",
+          "consistency": "26%",
+          "latestPrice": 68219.18,
+          "reason": "4h: 0.07%, 24h: N/A, consistency: 26%"
+        },
+        "sentiment": {
+          "sentiment": "neutral",
+          "score": 0,
+          "raw": "neutral",
+          "isBreaking": false,
+          "reason": "neutral (0% conf)"
+        },
+        "weight": 0,
+        "weightLabel": "neutral"
+      },
+      "ETH": {
+        "price": {
+          "trend": "neutral",
+          "score": 0.07,
+          "momentum4h": "0.08%",
+          "trend24h": "N/A",
+          "consistency": "19%",
+          "latestPrice": 1981.15,
+          "reason": "4h: 0.08%, 24h: N/A, consistency: 19%"
+        },
+        "sentiment": {
+          "sentiment": "neutral",
+          "score": 0,
+          "raw": "neutral",
+          "isBreaking": false,
+          "reason": "neutral (0% conf)"
+        },
+        "weight": 0,
+        "weightLabel": "neutral"
+      },
+      "SOL": {
+        "price": {
+          "trend": "neutral",
+          "score": -0.1,
+          "momentum4h": "-0.13%",
+          "trend24h": "N/A",
+          "consistency": "26%",
+          "latestPrice": 85.23,
+          "reason": "4h: -0.13%, 24h: N/A, consistency: 26%"
+        },
+        "sentiment": {
+          "sentiment": "neutral",
+          "score": 0,
+          "raw": "neutral",
+          "isBreaking": false,
+          "reason": "neutral (0% conf)"
+        },
+        "weight": 0,
+        "weightLabel": "neutral"
+      }
+    }
+  },
+  "updatedAt": "2026-02-22T15:24:08.144Z",
+  "updatedBy": "dashboard"
+}

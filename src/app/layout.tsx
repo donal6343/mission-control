@@ -3,8 +3,8 @@ import { NavBar } from "@/components/layout/NavBar";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Mission Control",
-  description: "OpenClaw AI Agent Mission Control Dashboard",
+  title: "Truebot Mission Control",
+  description: "Truebot AI Agent Mission Control Dashboard",
 };
 
 export default function RootLayout({

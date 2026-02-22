@@ -12,7 +12,7 @@ import {
   Activity, AlertTriangle, CheckCircle2, TrendingUp,
   Cpu, MemoryStick, LineChart, MessageSquare, ArrowUpRight, ArrowDownRight,
   Zap, Play, Twitter, ExternalLink, Reply, Image as ImageIcon, ChevronDown, ChevronRight,
-  Target, Coins, Camera, ChevronLeft, Calendar, Power, Shield, ShieldOff,
+  Target, Coins, Camera, ChevronLeft, Calendar, Power, Shield, ShieldOff, RefreshCw, Settings,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useState, useMemo, useCallback } from "react";
@@ -23,6 +23,9 @@ export default function HomePage() {
   const [activeTab, setActiveTab] = useState<TabType>("trueshot");
   const [expandedCron, setExpandedCron] = useState<string | null>(null);
   const [selectedDate, setSelectedDate] = useState(() => new Date().toISOString().split("T")[0]);
+  const [tradeFilter, setTradeFilter] = useState<'all' | 'paper' | 'real'>('all');
+  const [resolving, setResolving] = useState(false);
+  const [resolveMsg, setResolveMsg] = useState<string | null>(null);
   
   const { data: systemData, loading: sysLoading } = useApi<{
     servers: Array<{ name: string; status: string; uptime?: string; cpu?: number; memory?: number }>;
@@ -53,7 +56,7 @@ export default function HomePage() {
   }>("/api/suggested-tasks", { refreshInterval: REFRESH_INTERVAL });
 
   // Trades with date parameter
-  const { data: tradesData, loading: tradesLoading } = useApi<{
+  const { data: tradesData, loading: tradesLoading, refresh: refreshTrades } = useApi<{
     trades: Array<{ id: string; name: string; asset: string; direction: string; result: string; profit: number; confidence: number; notionUrl: string; windowEnd?: string; signals?: string; stake?: number; odds?: number }>;
     date: string;
     stats: { wins: number; losses: number; pending: number; pnl: string; winRate: string };
@@ -74,7 +77,7 @@ export default function HomePage() {
     reports: Array<{ id: string; name: string; url: string; createdTime: string; lastEditedTime: string }>;
   }>("/api/notion/reports", { refreshInterval: REFRESH_INTERVAL });
 
-  const { data: botData } = useApi<{
+  const { data: botData, refresh: refreshBotStatus } = useApi<{
     bot: { 
       name: string; 
       status: string; 
@@ -83,11 +86,23 @@ export default function HomePage() {
       lastStatus?: string; 
       lastDuration?: string; 
       nextRun?: string;
+      health?: {
+        consecutiveErrors: number;
+        lastSuccessfulRun: string | null;
+        erroringSince: string | null;
+        lastError: string | null;
+      };
       logic?: {
-        decisionPaths?: Array<{ name: string; requirement: string }>;
+        decisionPaths?: Array<{ name: string; key: string; requirement: string; type: string; enabled: boolean }>;
         signalCategories?: Array<{ name: string; description: string }>;
         safetyRails?: Array<{ rule: string; value: string }>;
+        assetConfig?: Array<{ asset: string; weight: number; sentiment: string; excluded: boolean }>;
+        stakeTiers?: Array<{ minConf: number; label: string; stake: number }>;
+        params?: Record<string, number>;
+        killSwitch?: boolean;
+        excludedAssets?: string[];
         currentMode?: string;
+        fairOddsFormula?: string;
       };
     };
   }>("/api/bot-status", { refreshInterval: REFRESH_INTERVAL });
@@ -121,9 +136,40 @@ export default function HomePage() {
     killInfo?: { activated: string; reason: string };
     walletConfigured: boolean;
     walletAddress?: string;
+    lastRun?: string;
+    botAlerts?: string[];
+    paperBalance?: number;
     daily: { date: string; tradesPlaced: number; totalPnl: number; openPositions: number };
     limits: { maxStakePerTrade: number; maxDailyLoss: number; maxDailyTrades: number; maxConcurrentPositions: number };
   }>("/api/trading-control", { refreshInterval: 5000 }); // faster refresh for kill switch
+
+  const { data: walletBalance } = useApi<{
+    address: string;
+    usdc: number;
+    matic: number;
+  }>("/api/wallet-balance", { refreshInterval: 30000 }); // refresh every 30s
+
+  // Compute filtered stats based on trade mode filter (all/paper/real)
+  const filteredStats = useMemo(() => {
+    if (!tradesData?.trades) return null;
+    const filtered = tradeFilter === 'all' ? tradesData.trades : tradesData.trades.filter((t: any) => t.mode === tradeFilter);
+    let wins = 0, losses = 0, pending = 0, pnl = 0;
+    filtered.forEach((t: any) => {
+      if (t.result === 'Win') { wins++; pnl += t.profit; }
+      else if (t.result === 'Loss') { losses++; pnl += t.profit; }
+      else { pending++; }
+    });
+    const winRate = wins + losses > 0 ? (wins / (wins + losses) * 100).toFixed(1) : 'N/A';
+    return { wins, losses, pending, pnl: pnl.toFixed(2), winRate };
+  }, [tradesData, tradeFilter]);
+
+  // Compute filtered all-time stats from API per-mode breakdowns
+  const filteredAllTime = useMemo(() => {
+    if (tradeFilter === 'all') return tradesData?.allTime || null;
+    if (tradeFilter === 'paper') return (tradesData as any)?.allTimePaper || null;
+    if (tradeFilter === 'real') return (tradesData as any)?.allTimeReal || null;
+    return tradesData?.allTime || null;
+  }, [tradesData, tradeFilter]);
 
   const toggleKillSwitch = useCallback(async () => {
     const action = tradingControl?.killSwitch ? "unkill" : "kill";
@@ -140,6 +186,10 @@ export default function HomePage() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: "set-mode", mode }),
     });
+    // Sync trade filter to match mode
+    if (mode === 'paper') setTradeFilter('paper');
+    else if (mode === 'real') setTradeFilter('real');
+    else setTradeFilter('all');
   }, []);
 
   // Date navigation helpers
@@ -164,7 +214,7 @@ export default function HomePage() {
 
   if (sysLoading && agentLoading && cronLoading) {
     return (
-      <PageWrapper title="Dashboard" subtitle="OpenClaw Mission Control">
+      <PageWrapper title="Dashboard" subtitle="Truebot Mission Control">
         <GridSkeleton count={6} />
       </PageWrapper>
     );
@@ -178,216 +228,7 @@ export default function HomePage() {
   const contentInProgress = contentData?.items?.filter((i) => i.status !== "published").length || 0;
 
   return (
-    <PageWrapper title="Dashboard" subtitle="OpenClaw Mission Control">
-      {/* Polymarket Section - TOP */}
-      <GlassCard index={0} className="mb-6 border-accent-yellow/20">
-        {/* Header */}
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
-          <div className="flex items-center gap-3">
-            <Coins className="w-5 h-5 text-accent-yellow" />
-            <h2 className="text-sm font-semibold text-zinc-200 uppercase tracking-wider">Polymarket 15M Bot</h2>
-            {botData?.bot?.status === "running" && (
-              <span className="flex items-center gap-1.5 text-[10px] px-2 py-0.5 rounded-full bg-accent-green/20 text-accent-green">
-                <span className="w-1.5 h-1.5 rounded-full bg-accent-green animate-pulse" />
-                LIVE
-              </span>
-            )}
-          </div>
-          {/* All-time stats */}
-          {tradesData?.allTime && (
-            <div className="flex flex-wrap items-center gap-2 sm:gap-4 text-xs">
-              <span className="text-zinc-500">All-time:</span>
-              <span className="text-zinc-400">{tradesData.allTime.wins}W/{tradesData.allTime.losses}L</span>
-              <span className={`font-semibold ${parseFloat(tradesData.allTime.pnl) >= 0 ? "text-accent-green" : "text-accent-red"}`}>
-                {parseFloat(tradesData.allTime.pnl) >= 0 ? "+" : ""}${tradesData.allTime.pnl}
-              </span>
-              <span className="text-zinc-500">({tradesData.allTime.winRate}%)</span>
-            </div>
-          )}
-        </div>
-
-        {/* Trading Controls Bar */}
-        <div className="flex flex-col sm:flex-row sm:items-center gap-3 mb-4 p-3 rounded-lg bg-white/[0.02] border border-white/[0.05]">
-          {/* Mode Selector */}
-          <div className="flex items-center gap-2">
-            <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Mode:</span>
-            <div className="flex gap-1">
-              {(["paper", "real", "disabled"] as const).map((m) => (
-                <button
-                  key={m}
-                  onClick={() => setTradingMode(m)}
-                  className={`text-[10px] px-2.5 py-1 rounded-md font-medium transition-all ${
-                    tradingControl?.mode === m
-                      ? m === "real" ? "bg-accent-green/20 text-accent-green border border-accent-green/30"
-                      : m === "disabled" ? "bg-accent-red/20 text-accent-red border border-accent-red/30"
-                      : "bg-accent-yellow/20 text-accent-yellow border border-accent-yellow/30"
-                      : "bg-white/[0.03] text-zinc-500 border border-white/[0.05] hover:bg-white/[0.05]"
-                  }`}
-                >
-                  {m === "paper" ? "📄 Paper" : m === "real" ? "💰 Real" : "⛔ Off"}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Kill Switch */}
-          <button
-            onClick={toggleKillSwitch}
-            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
-              tradingControl?.killSwitch
-                ? "bg-accent-red/20 text-accent-red border border-accent-red/30 animate-pulse"
-                : "bg-white/[0.03] text-zinc-400 border border-white/[0.05] hover:bg-accent-red/10 hover:text-accent-red hover:border-accent-red/20"
-            }`}
-          >
-            {tradingControl?.killSwitch ? (
-              <><ShieldOff className="w-3.5 h-3.5" /> KILLED — Click to Resume</>
-            ) : (
-              <><Shield className="w-3.5 h-3.5" /> Kill Switch</>
-            )}
-          </button>
-
-          {/* Wallet Status */}
-          <div className="flex items-center gap-2 ml-auto text-[10px]">
-            {tradingControl?.walletConfigured ? (
-              <span className="text-zinc-500">
-                Wallet: <span className="text-zinc-400 font-mono">{tradingControl.walletAddress?.slice(0, 6)}...{tradingControl.walletAddress?.slice(-4)}</span>
-              </span>
-            ) : (
-              <span className="text-zinc-600">No wallet configured</span>
-            )}
-          </div>
-
-          {/* Daily real trading stats */}
-          {tradingControl?.mode === "real" && tradingControl.daily.tradesPlaced > 0 && (
-            <div className="flex items-center gap-3 text-[10px] text-zinc-500">
-              <span>Today: {tradingControl.daily.tradesPlaced} trades</span>
-              <span className={tradingControl.daily.totalPnl >= 0 ? "text-accent-green" : "text-accent-red"}>
-                {tradingControl.daily.totalPnl >= 0 ? "+" : ""}${tradingControl.daily.totalPnl.toFixed(2)}
-              </span>
-            </div>
-          )}
-        </div>
-
-        {/* Date Navigation */}
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4 pb-3 border-b border-white/[0.05]">
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => navigateDate(-1)}
-              className="p-1.5 rounded-lg bg-white/[0.03] hover:bg-white/[0.06] border border-white/[0.05] transition-colors"
-            >
-              <ChevronLeft className="w-4 h-4 text-zinc-400" />
-            </button>
-            <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/[0.03] border border-white/[0.05]">
-              <Calendar className="w-3.5 h-3.5 text-zinc-500" />
-              <span className="text-sm font-medium text-zinc-200">{formatDateLabel(selectedDate)}</span>
-              <span className="text-xs text-zinc-500 hidden sm:inline">{selectedDate}</span>
-            </div>
-            <button
-              onClick={() => navigateDate(1)}
-              disabled={isToday}
-              className={`p-1.5 rounded-lg border border-white/[0.05] transition-colors ${
-                isToday ? "bg-white/[0.01] text-zinc-600 cursor-not-allowed" : "bg-white/[0.03] hover:bg-white/[0.06] text-zinc-400"
-              }`}
-            >
-              <ChevronRight className="w-4 h-4" />
-            </button>
-            {!isToday && (
-              <button
-                onClick={() => setSelectedDate(new Date().toISOString().split("T")[0])}
-                className="text-xs text-primary-400 hover:text-primary-300 ml-1"
-              >
-                Today
-              </button>
-            )}
-          </div>
-          
-          {/* Day stats */}
-          {tradesData?.stats && (
-            <div className="flex items-center gap-3">
-              <span className="text-sm text-zinc-300">{tradesData.stats.wins}W/{tradesData.stats.losses}L</span>
-              {tradesData.stats.pending > 0 && (
-                <span className="text-xs text-accent-yellow">({tradesData.stats.pending} pending)</span>
-              )}
-              <span className={`text-lg font-bold ${parseFloat(tradesData.stats.pnl) >= 0 ? "text-accent-green" : "text-accent-red"}`}>
-                {parseFloat(tradesData.stats.pnl) >= 0 ? "+" : ""}${tradesData.stats.pnl}
-              </span>
-            </div>
-          )}
-        </div>
-
-        {/* Trades List */}
-        <div className="space-y-2 max-h-[400px] overflow-y-auto custom-scrollbar">
-          {tradesLoading ? (
-            <div className="text-center py-8">
-              <div className="inline-block w-5 h-5 border-2 border-accent-yellow/30 border-t-accent-yellow rounded-full animate-spin" />
-            </div>
-          ) : tradesData?.trades && tradesData.trades.length > 0 ? (
-            tradesData.trades.map((trade: any) => (
-              <a 
-                key={trade.id} 
-                href={trade.notionUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center gap-3 py-2.5 px-2.5 sm:px-3 hover:bg-white/[0.03] rounded-lg cursor-pointer transition-colors border border-white/[0.03] bg-white/[0.01]"
-              >
-                {/* Direction Icon */}
-                {trade.direction === "Up" ? (
-                  <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-accent-green/10 flex items-center justify-center shrink-0">
-                    <ArrowUpRight className="w-4 h-4 sm:w-5 sm:h-5 text-accent-green" />
-                  </div>
-                ) : (
-                  <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-accent-red/10 flex items-center justify-center shrink-0">
-                    <ArrowDownRight className="w-4 h-4 sm:w-5 sm:h-5 text-accent-red" />
-                  </div>
-                )}
-                
-                {/* Trade Info */}
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
-                    <span className="text-sm text-zinc-200 font-medium">{trade.asset}</span>
-                    <span className={`text-[10px] sm:text-xs px-1 sm:px-1.5 py-0.5 rounded ${
-                      trade.direction === "Up" ? "bg-accent-green/10 text-accent-green" : "bg-accent-red/10 text-accent-red"
-                    }`}>{trade.direction}</span>
-                    <span className="text-[10px] sm:text-xs text-zinc-500">{(trade.confidence * 100).toFixed(0)}%</span>
-                    {trade.odds && <span className="text-[10px] text-zinc-600 hidden sm:inline">@ {(trade.odds * 100).toFixed(0)}%</span>}
-                  </div>
-                  <div className="text-[9px] sm:text-[10px] text-zinc-500 mt-0.5 truncate">
-                    {trade.windowEnd ? new Date(trade.windowEnd).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '-'}
-                    {trade.signals && <span className="ml-1.5 truncate">📊 {trade.signals.substring(0, 40)}{trade.signals.length > 40 ? '...' : ''}</span>}
-                  </div>
-                </div>
-                
-                {/* Result */}
-                <div className="flex flex-col items-end gap-0.5 shrink-0">
-                  <span className={`text-[10px] sm:text-xs px-2 py-0.5 sm:py-1 rounded-lg font-medium ${
-                    trade.result === "Win" ? "bg-accent-green/20 text-accent-green" :
-                    trade.result === "Loss" ? "bg-accent-red/20 text-accent-red" :
-                    "bg-accent-yellow/20 text-accent-yellow"
-                  }`}>
-                    {trade.result === "Pending" ? "⏳" : trade.result}
-                  </span>
-                  {trade.result !== "Pending" && (
-                    <span className={`text-xs sm:text-sm font-semibold ${trade.profit >= 0 ? "text-accent-green" : "text-accent-red"}`}>
-                      {trade.profit >= 0 ? "+" : ""}${trade.profit.toFixed(2)}
-                    </span>
-                  )}
-                </div>
-              </a>
-            ))
-          ) : (
-            <div className="text-center py-8">
-              <p className="text-sm text-zinc-500">No trades on {formatDateLabel(selectedDate)}</p>
-              <button 
-                onClick={() => navigateDate(-1)}
-                className="text-xs text-primary-400 hover:text-primary-300 mt-2"
-              >
-                ← Check previous day
-              </button>
-            </div>
-          )}
-        </div>
-      </GlassCard>
-
+    <PageWrapper title="Dashboard" subtitle="Truebot Mission Control">
       {/* Tab Navigation */}
       <div className="flex gap-2 mb-6">
         <button
@@ -584,7 +425,7 @@ export default function HomePage() {
                       </span>
                     )}
                     {cron.duration && <span className="text-zinc-600">{cron.duration}</span>}
-                    {cron.lastRun && <span className="text-zinc-500">{formatRelativeTime(cron.lastRun)}</span>}
+                    {cron.lastRun && <span className="text-zinc-500">{formatRelativeTime(cron.lastRun, true)}</span>}
                     {!cron.enabled && <span className="text-zinc-600 italic">disabled</span>}
                   </div>
                 </div>
@@ -823,6 +664,522 @@ export default function HomePage() {
       ) : (
         /* Crypto Tab Content */
         <>
+      {/* Polymarket Section TOP */}
+        <GlassCard index={0} className="mb-6 border-accent-yellow/20">
+          {/* Header */}
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
+            <div className="flex items-center gap-3">
+              <Coins className="w-5 h-5 text-accent-yellow" />
+              <h2 className="text-sm font-semibold text-zinc-200 uppercase tracking-wider">Polymarket 15M Bot</h2>
+              {botData?.bot?.status === "error" ? (
+                <span className="flex items-center gap-1.5 text-[10px] px-2 py-0.5 rounded-full bg-accent-red/20 text-accent-red">
+                  <span className="w-1.5 h-1.5 rounded-full bg-accent-red animate-pulse" />
+                  ERROR
+                </span>
+              ) : botData?.bot?.status === "stale" ? (
+                <span className="flex items-center gap-1.5 text-[10px] px-2 py-0.5 rounded-full bg-accent-yellow/20 text-accent-yellow">
+                  <span className="w-1.5 h-1.5 rounded-full bg-accent-yellow animate-pulse" />
+                  STALE
+                </span>
+              ) : botData?.bot?.status === "running" ? (
+                <span className="flex items-center gap-1.5 text-[10px] px-2 py-0.5 rounded-full bg-accent-green/20 text-accent-green">
+                  <span className="w-1.5 h-1.5 rounded-full bg-accent-green animate-pulse" />
+                  LIVE
+                </span>
+              ) : null}
+            </div>
+            {/* All-time stats */}
+            {(tradeFilter === 'all' ? tradesData?.allTime : filteredAllTime) && (
+              <div className="flex flex-wrap items-center gap-2 sm:gap-4 text-xs">
+                <span className="text-zinc-500">{tradeFilter === 'all' ? 'All-time:' : tradeFilter === 'paper' ? '📄 Paper:' : '💰 Real:'}</span>
+                <span className="text-zinc-400">{(tradeFilter === 'all' ? tradesData?.allTime : filteredAllTime)?.wins}W/{(tradeFilter === 'all' ? tradesData?.allTime : filteredAllTime)?.losses}L</span>
+                <span className={`font-semibold ${parseFloat((tradeFilter === 'all' ? tradesData?.allTime : filteredAllTime)?.pnl || '0') >= 0 ? "text-accent-green" : "text-accent-red"}`}>
+                  {parseFloat((tradeFilter === 'all' ? tradesData?.allTime : filteredAllTime)?.pnl || '0') >= 0 ? "+" : ""}${(tradeFilter === 'all' ? tradesData?.allTime : filteredAllTime)?.pnl}
+                </span>
+                <span className="text-zinc-500">({(tradeFilter === 'all' ? tradesData?.allTime : filteredAllTime)?.winRate}%)</span>
+              </div>
+            )}
+          </div>
+
+          {/* Status Bar: Last Run + Balance */}
+          <div className="flex flex-wrap items-center gap-4 mb-4 px-3 py-2 rounded-lg bg-white/[0.02] border border-white/[0.04] text-[11px]">
+            {/* Last Run */}
+            <div className="flex items-center gap-2">
+              <Clock className="w-3.5 h-3.5 text-zinc-500" />
+              <span className="text-zinc-500">Last run:</span>
+              {tradingControl?.lastRun ? (
+                <span className="text-zinc-300">{formatRelativeTime(tradingControl.lastRun, true)}</span>
+              ) : (
+                <span className="text-zinc-600">—</span>
+              )}
+            </div>
+
+            {/* Divider */}
+            <span className="text-zinc-700">|</span>
+
+            {/* Wallet Balance */}
+            <div className="flex items-center gap-2">
+              <DollarSign className="w-3.5 h-3.5 text-zinc-500" />
+              {tradingControl?.mode === "paper" ? (
+                <>
+                  <span className="text-zinc-500">Paper balance:</span>
+                  <span className="text-accent-yellow font-mono font-medium">
+                    ${(tradeFilter === 'all' || tradeFilter === 'paper') && tradesData?.allTime ? (1000 + parseFloat((tradeFilter === 'all' ? tradesData.allTime : filteredAllTime)?.pnl || '0')).toFixed(2) : tradingControl?.paperBalance?.toFixed(2) || "1,000.00"}
+                  </span>
+                </>
+              ) : walletBalance ? (
+                <>
+                  <span className="text-zinc-500">Wallet:</span>
+                  <span className="text-accent-green font-mono font-medium">${walletBalance.usdc.toFixed(2)} USDC</span>
+                  <span className="text-zinc-600">+ {walletBalance.matic.toFixed(4)} POL</span>
+                </>
+              ) : tradingControl?.walletConfigured ? (
+                <span className="text-zinc-500">Loading balance...</span>
+              ) : (
+                <span className="text-zinc-600">No wallet</span>
+              )}
+            </div>
+
+            {/* Alerts */}
+            {tradingControl?.botAlerts && tradingControl.botAlerts.length > 0 && (
+              <>
+                <span className="text-zinc-700">|</span>
+                <div className="flex items-center gap-1.5 text-accent-red">
+                  <AlertTriangle className="w-3.5 h-3.5" />
+                  <span>{tradingControl.botAlerts[0]}</span>
+                </div>
+              </>
+            )}
+          </div>
+
+          {/* Error Banner */}
+          {botData?.bot?.status === "error" && botData?.bot?.health && (
+            <div className="mb-4 px-4 py-3 rounded-lg bg-accent-red/10 border border-accent-red/30 text-xs">
+              <div className="flex items-center gap-2 text-accent-red font-semibold mb-1">
+                <AlertTriangle className="w-4 h-4" />
+                Bot is crashing — not trading!
+              </div>
+              <div className="text-zinc-400 space-y-0.5">
+                <div>Error: <span className="text-zinc-300 font-mono">{botData.bot.health.lastError}</span></div>
+                <div>Failing since: <span className="text-zinc-300">{botData.bot.health.erroringSince ? formatRelativeTime(botData.bot.health.erroringSince, true) : 'unknown'}</span></div>
+                <div>Consecutive failures: <span className="text-zinc-300">{botData.bot.health.consecutiveErrors}</span></div>
+                {botData.bot.health.lastSuccessfulRun && (
+                  <div>Last successful run: <span className="text-zinc-300">{formatRelativeTime(botData.bot.health.lastSuccessfulRun, true)}</span></div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Trading Controls Bar */}
+          <div className="flex flex-col sm:flex-row sm:items-center gap-3 mb-4 p-3 rounded-lg bg-white/[0.02] border border-white/[0.05]">
+            {/* Mode Selector */}
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Mode:</span>
+              <div className="flex gap-1">
+                {(["paper", "real", "disabled"] as const).map((m) => (
+                  <button
+                    key={m}
+                    onClick={() => setTradingMode(m)}
+                    className={`text-[10px] px-2.5 py-1 rounded-md font-medium transition-all ${
+                      tradingControl?.mode === m
+                        ? m === "real" ? "bg-accent-green/20 text-accent-green border border-accent-green/30"
+                        : m === "disabled" ? "bg-accent-red/20 text-accent-red border border-accent-red/30"
+                        : "bg-accent-yellow/20 text-accent-yellow border border-accent-yellow/30"
+                        : "bg-white/[0.03] text-zinc-500 border border-white/[0.05] hover:bg-white/[0.05]"
+                    }`}
+                  >
+                    {m === "paper" ? "📄 Paper" : m === "real" ? "💰 Real" : "⛔ Off"}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Kill Switch */}
+            <button
+              onClick={toggleKillSwitch}
+              className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
+                tradingControl?.killSwitch
+                  ? "bg-accent-red/20 text-accent-red border border-accent-red/30 animate-pulse"
+                  : "bg-white/[0.03] text-zinc-400 border border-white/[0.05] hover:bg-accent-red/10 hover:text-accent-red hover:border-accent-red/20"
+              }`}
+            >
+              {tradingControl?.killSwitch ? (
+                <><ShieldOff className="w-3.5 h-3.5" /> KILLED — Click to Resume</>
+              ) : (
+                <><Shield className="w-3.5 h-3.5" /> Kill Switch</>
+              )}
+            </button>
+
+            {/* Wallet Status */}
+            <div className="flex items-center gap-2 ml-auto text-[10px]">
+              {tradingControl?.walletConfigured ? (
+                <span className="text-zinc-500">
+                  Wallet: <a href={`https://polymarket.com/profile/${tradingControl.walletAddress}`} target="_blank" rel="noopener noreferrer" className="text-zinc-400 font-mono hover:text-accent-green transition-colors">{tradingControl.walletAddress?.slice(0, 6)}...{tradingControl.walletAddress?.slice(-4)} ↗</a>
+                </span>
+              ) : (
+                <span className="text-zinc-600">No wallet configured</span>
+              )}
+            </div>
+
+            {/* Daily real trading stats */}
+            {tradingControl?.mode === "real" && tradingControl.daily.tradesPlaced > 0 && (
+              <div className="flex items-center gap-3 text-[10px] text-zinc-500">
+                <span>Today: {tradingControl.daily.tradesPlaced} trades</span>
+                <span className={tradingControl.daily.totalPnl >= 0 ? "text-accent-green" : "text-accent-red"}>
+                  {tradingControl.daily.totalPnl >= 0 ? "+" : ""}${tradingControl.daily.totalPnl.toFixed(2)}
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* Date Navigation */}
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4 pb-3 border-b border-white/[0.05]">
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => navigateDate(-1)}
+                className="p-1.5 rounded-lg bg-white/[0.03] hover:bg-white/[0.06] border border-white/[0.05] transition-colors"
+              >
+                <ChevronLeft className="w-4 h-4 text-zinc-400" />
+              </button>
+              <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/[0.03] border border-white/[0.05]">
+                <Calendar className="w-3.5 h-3.5 text-zinc-500" />
+                <span className="text-sm font-medium text-zinc-200">{formatDateLabel(selectedDate)}</span>
+                <span className="text-xs text-zinc-500 hidden sm:inline">{selectedDate}</span>
+              </div>
+              <button
+                onClick={() => navigateDate(1)}
+                disabled={isToday}
+                className={`p-1.5 rounded-lg border border-white/[0.05] transition-colors ${
+                  isToday ? "bg-white/[0.01] text-zinc-600 cursor-not-allowed" : "bg-white/[0.03] hover:bg-white/[0.06] text-zinc-400"
+                }`}
+              >
+                <ChevronRight className="w-4 h-4" />
+              </button>
+              {!isToday && (
+                <button
+                  onClick={() => setSelectedDate(new Date().toISOString().split("T")[0])}
+                  className="text-xs text-primary-400 hover:text-primary-300 ml-1"
+                >
+                  Today
+                </button>
+              )}
+            </div>
+          
+            {/* Day stats */}
+            {(filteredStats || tradesData?.stats) && (
+              <div className="flex items-center gap-3">
+                <span className="text-sm text-zinc-300">{(filteredStats || tradesData?.stats)?.wins}W/{(filteredStats || tradesData?.stats)?.losses}L</span>
+                {((filteredStats || tradesData?.stats)?.pending ?? 0) > 0 && (
+                  <span className="text-xs text-accent-yellow">({(filteredStats || tradesData?.stats)?.pending} pending)</span>
+                )}
+                <button
+                  onClick={async () => {
+                    setResolving(true);
+                    setResolveMsg(null);
+                    try {
+                      const res = await fetch("/api/resolve-trades", { method: "POST" });
+                      const data = await res.json();
+                      setResolveMsg(data.ok ? "✅ Resolved" : "❌ Failed");
+                      refreshTrades();
+                    } catch { setResolveMsg("❌ Error"); }
+                    setTimeout(() => setResolveMsg(null), 3000);
+                    setResolving(false);
+                  }}
+                  disabled={resolving}
+                  className="p-1 rounded-md bg-white/[0.05] hover:bg-white/[0.10] border border-white/[0.08] transition-colors disabled:opacity-50"
+                  title="Resolve pending trades & refresh"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 text-zinc-400 ${resolving ? "animate-spin" : ""}`} />
+                </button>
+                {resolveMsg && <span className="text-xs text-zinc-400">{resolveMsg}</span>}
+                <span className={`text-lg font-bold ${parseFloat((filteredStats || tradesData?.stats)?.pnl || '0') >= 0 ? "text-accent-green" : "text-accent-red"}`}>
+                  {parseFloat((filteredStats || tradesData?.stats)?.pnl || '0') >= 0 ? "+" : ""}${(filteredStats || tradesData?.stats)?.pnl}
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* Trade Mode Filter */}
+          <div className="flex gap-1 mb-2">
+            {(['all', 'paper', 'real'] as const).map(f => (
+              <button
+                key={f}
+                onClick={() => setTradeFilter(f)}
+                className={`text-[10px] px-2 py-0.5 rounded transition-colors ${
+                  tradeFilter === f
+                    ? f === 'real' ? 'bg-accent-green/20 text-accent-green' : f === 'paper' ? 'bg-accent-yellow/20 text-accent-yellow' : 'bg-white/10 text-zinc-200'
+                    : 'text-zinc-500 hover:text-zinc-300'
+                }`}
+              >
+                {f === 'all' ? 'All' : f === 'paper' ? '📄 Paper' : '💰 Real'}
+              </button>
+            ))}
+          </div>
+
+          {/* Trades List */}
+          <div className="space-y-2 max-h-[400px] overflow-y-auto custom-scrollbar">
+            {tradesLoading ? (
+              <div className="text-center py-8">
+                <div className="inline-block w-5 h-5 border-2 border-accent-yellow/30 border-t-accent-yellow rounded-full animate-spin" />
+              </div>
+            ) : tradesData?.trades && tradesData.trades.filter((t: any) => tradeFilter === 'all' || t.mode === tradeFilter).length > 0 ? (
+              tradesData.trades.filter((t: any) => tradeFilter === 'all' || t.mode === tradeFilter).map((trade: any) => (
+                <a 
+                  key={trade.id} 
+                  href={trade.notionUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center gap-3 py-2.5 px-2.5 sm:px-3 hover:bg-white/[0.03] rounded-lg cursor-pointer transition-colors border border-white/[0.03] bg-white/[0.01]"
+                >
+                  {/* Direction Icon */}
+                  {trade.direction === "Up" ? (
+                    <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-accent-green/10 flex items-center justify-center shrink-0">
+                      <ArrowUpRight className="w-4 h-4 sm:w-5 sm:h-5 text-accent-green" />
+                    </div>
+                  ) : (
+                    <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-accent-red/10 flex items-center justify-center shrink-0">
+                      <ArrowDownRight className="w-4 h-4 sm:w-5 sm:h-5 text-accent-red" />
+                    </div>
+                  )}
+                
+                  {/* Trade Info */}
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
+                      <span className="text-sm text-zinc-200 font-medium">{trade.asset}</span>
+                      <span className={`text-[10px] sm:text-xs px-1 sm:px-1.5 py-0.5 rounded ${
+                        trade.direction === "Up" ? "bg-accent-green/10 text-accent-green" : "bg-accent-red/10 text-accent-red"
+                      }`}>{trade.direction}</span>
+                      <span className="text-[10px] sm:text-xs text-zinc-500">{(trade.confidence * 100).toFixed(0)}%</span>
+                      {trade.odds && <span className="text-[10px] text-zinc-600 hidden sm:inline">@ {(trade.odds * 100).toFixed(0)}%</span>}
+                    </div>
+                    <div className="text-[9px] sm:text-[10px] text-zinc-500 mt-0.5 truncate">
+                      {trade.windowEnd ? new Date(trade.windowEnd).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '-'}
+                      {trade.signals && <span className="ml-1.5 truncate">📊 {trade.signals.substring(0, 40)}{trade.signals.length > 40 ? '...' : ''}</span>}
+                    </div>
+                  </div>
+                
+                  {/* Result */}
+                  <div className="flex flex-col items-end gap-0.5 shrink-0">
+                    <div className="flex items-center gap-1">
+                      {trade.mode === 'real' && <span className="text-[8px] px-1 rounded bg-accent-green/20 text-accent-green">REAL</span>}
+                      <span className={`text-[10px] sm:text-xs px-2 py-0.5 sm:py-1 rounded-lg font-medium ${
+                        trade.result === "Win" ? "bg-accent-green/20 text-accent-green" :
+                        trade.result === "Loss" ? "bg-accent-red/20 text-accent-red" :
+                        trade.result === "Rejected" ? "bg-orange-500/20 text-orange-400" :
+                        "bg-accent-yellow/20 text-accent-yellow"
+                      }`}>
+                        {trade.result === "Pending" ? "⏳" : trade.result === "Rejected" ? "❌ Rejected" : trade.result}
+                      </span>
+                    </div>
+                    {trade.rejectionReason && (
+                      <span className="text-[9px] text-orange-400/70 truncate max-w-[120px]" title={trade.rejectionReason}>{trade.rejectionReason}</span>
+                    )}
+                    {trade.result !== "Pending" && trade.result !== "Rejected" && (
+                      <span className={`text-xs sm:text-sm font-semibold ${trade.profit >= 0 ? "text-accent-green" : "text-accent-red"}`}>
+                        {trade.profit >= 0 ? "+" : ""}${trade.profit.toFixed(2)}
+                      </span>
+                    )}
+                  </div>
+                </a>
+              ))
+            ) : (
+              <div className="text-center py-8">
+                <p className="text-sm text-zinc-500">No trades on {formatDateLabel(selectedDate)}</p>
+                <button 
+                  onClick={() => navigateDate(-1)}
+                  className="text-xs text-primary-400 hover:text-primary-300 mt-2"
+                >
+                  ← Check previous day
+                </button>
+              </div>
+            )}
+          </div>
+        </GlassCard>
+
+          {/* Trading Control Panel */}
+          {botData?.bot?.logic && (() => {
+            const logic = botData.bot.logic;
+            const postConfig = async (body: any) => {
+              try {
+                await fetch('/api/trading-config', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(body),
+                });
+                refreshBotStatus();
+              } catch {}
+            };
+            return (
+            <GlassCard index={2} className="mb-4 sm:mb-6">
+              <div className="flex items-center justify-between mb-3">
+                <CardHeader icon={Settings} title="Trading Control Panel" badge={logic.currentMode} />
+                {/* Kill Switch */}
+                <button
+                  onClick={() => postConfig({ action: 'killSwitch', enabled: !logic.killSwitch })}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                    logic.killSwitch
+                      ? 'bg-accent-red/20 text-accent-red border border-accent-red/30 animate-pulse'
+                      : 'bg-zinc-700/50 text-zinc-400 border border-zinc-600/30 hover:bg-zinc-700'
+                  }`}
+                >
+                  <Power className="w-3.5 h-3.5" />
+                  {logic.killSwitch ? '🛑 PAUSED' : 'Trading Active'}
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                {/* Column 1: Decision Paths */}
+                <div>
+                  <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">Decision Paths</h3>
+                  <div className="space-y-1.5">
+                    {logic.decisionPaths?.map((path: any, i: number) => (
+                      <div key={i} className={`flex items-center gap-2 text-xs ${!path.enabled ? 'opacity-40' : ''}`}>
+                        <button
+                          onClick={() => postConfig({ action: 'togglePath', pathName: path.key, enabled: !path.enabled })}
+                          className={`w-8 h-4 rounded-full relative transition-colors shrink-0 ${
+                            path.enabled ? 'bg-accent-green/60' : 'bg-zinc-700'
+                          }`}
+                        >
+                          <div className="w-3 h-3 rounded-full bg-white absolute top-0.5 transition-all" style={{ left: path.enabled ? '17px' : '2px' }} />
+                        </button>
+                        <span className="text-zinc-200 font-medium whitespace-nowrap">{path.name}</span>
+                        <span className="text-zinc-500 truncate">{path.requirement}</span>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Asset Toggles */}
+                  {logic.assetConfig && (
+                    <div className="mt-3">
+                      <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">Assets</h3>
+                      <div className="flex gap-2 flex-wrap">
+                        {logic.assetConfig.map((a: any) => (
+                          <button
+                            key={a.asset}
+                            onClick={() => postConfig({ action: 'toggleAsset', asset: a.asset, excluded: !a.excluded })}
+                            className={`text-xs px-2 py-1 rounded-lg border transition-colors ${
+                              a.excluded ? "border-red-500/30 bg-red-500/10 text-red-400" :
+                              a.sentiment === "bullish" ? "border-accent-green/30 bg-accent-green/10 text-accent-green" :
+                              a.sentiment === "bearish" ? "border-accent-red/30 bg-accent-red/10 text-accent-red" :
+                              "border-zinc-600/30 bg-zinc-600/10 text-zinc-400"
+                            }`}
+                          >
+                            <span className="font-medium">{a.asset}</span>
+                            {a.excluded ? " ✗" : ` ${a.weight > 0 ? "+" : ""}${(a.weight * 100).toFixed(0)}%`}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Column 2: Parameters */}
+                <div>
+                  <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">Parameters</h3>
+                  <div className="space-y-2">
+                    {[
+                      { key: 'minEdge', label: 'Min Edge', scale: 100, min: 1, max: 20 },
+                      { key: 'minMarketOdds', label: 'Min Market Odds', scale: 100, min: 20, max: 60 },
+                      { key: 'arbMinDiscrepancy', label: 'ARB Min Discrepancy', scale: 100, min: 1, max: 10 },
+                      { key: 'arbMinConfidence', label: 'ARB Min Confidence', scale: 100, min: 30, max: 70 },
+                      { key: 'breakingNewsMinConfidence', label: 'News Min Conf', scale: 100, min: 40, max: 80 },
+                      { key: 'path1Confidence', label: 'Path1 Min Conf', scale: 100, min: 40, max: 80 },
+                      { key: 'path2Confidence', label: 'Path2 Min Conf', scale: 100, min: 40, max: 80 },
+                      { key: 'path3Confidence', label: 'Path3 Min Conf', scale: 100, min: 50, max: 90 },
+                    ].map(({ key, label, scale, min, max }) => {
+                      const val = logic.params?.[key] !== undefined ? Math.round(logic.params[key] * scale) : 0;
+                      return (
+                        <div key={key} className="flex items-center justify-between text-xs gap-2">
+                          <span className="text-zinc-400 truncate">{label}</span>
+                          <div className="flex items-center gap-1">
+                            <button
+                              onClick={() => { const nv = Math.max(min, val - 1); if (nv !== val) postConfig({ action: 'updateParam', key, value: nv / scale }); }}
+                              className="w-5 h-5 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-300 flex items-center justify-center"
+                            >-</button>
+                            <div className="flex items-center gap-0">
+                              <input
+                                type="number"
+                                defaultValue={val}
+                                min={min}
+                                max={max}
+                                onBlur={(e) => {
+                                  const v = parseInt(e.target.value);
+                                  if (!isNaN(v) && v >= min && v <= max && v !== val) {
+                                    postConfig({ action: 'updateParam', key, value: v / scale });
+                                  }
+                                }}
+                                onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+                                className="w-10 bg-transparent text-zinc-200 font-mono text-center border-b border-zinc-600 focus:border-accent-yellow outline-none py-0.5"
+                              />
+                              <span className="text-zinc-500">%</span>
+                            </div>
+                            <button
+                              onClick={() => { const nv = Math.min(max, val + 1); if (nv !== val) postConfig({ action: 'updateParam', key, value: nv / scale }); }}
+                              className="w-5 h-5 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-300 flex items-center justify-center"
+                            >+</button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Column 3: Stake Tiers */}
+                <div>
+                  <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">Confidence → Stake</h3>
+                  <div className="space-y-2">
+                    {logic.stakeTiers?.map((tier: any, i: number) => (
+                      <div key={i} className={`flex items-center justify-between text-xs px-2.5 py-1.5 rounded-lg border ${
+                        i === 0 ? 'border-accent-green/30 bg-accent-green/10' :
+                        i === 1 ? 'border-accent-yellow/30 bg-accent-yellow/10' :
+                        i === 2 ? 'border-zinc-500/30 bg-zinc-500/10' :
+                        'border-accent-red/30 bg-accent-red/10'
+                      }`}>
+                        <span className={`font-medium ${
+                          i === 0 ? 'text-accent-green' : i === 1 ? 'text-accent-yellow' : i === 2 ? 'text-zinc-300' : 'text-accent-red'
+                        }`}>{tier.label}</span>
+                        <div className="flex items-center gap-1">
+                          <button
+                            onClick={() => postConfig({ action: 'updateStakeTier', index: i, stake: Math.max(1, tier.stake - 5) })}
+                            className="w-5 h-5 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-300 flex items-center justify-center"
+                          >-</button>
+                          <div className="flex items-center gap-0">
+                            <span className="text-zinc-400">$</span>
+                            <input
+                              type="number"
+                              defaultValue={tier.stake}
+                              min={1}
+                              max={100}
+                              onBlur={(e) => {
+                                const val = parseInt(e.target.value);
+                                if (!isNaN(val) && val > 0 && val !== tier.stake) {
+                                  postConfig({ action: 'updateStakeTier', index: i, stake: val });
+                                }
+                              }}
+                              onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
+                              className="w-10 bg-transparent text-zinc-200 font-mono text-center border-b border-zinc-600 focus:border-accent-yellow outline-none py-0.5"
+                            />
+                          </div>
+                          <button
+                            onClick={() => postConfig({ action: 'updateStakeTier', index: i, stake: tier.stake + 5 })}
+                            className="w-5 h-5 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-300 flex items-center justify-center"
+                          >+</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {logic.fairOddsFormula && (
+                    <div className="mt-3 pt-3 border-t border-white/[0.05] text-[10px] text-zinc-500">
+                      Fair odds: <span className="font-mono text-zinc-400">{logic.fairOddsFormula}</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </GlassCard>
+            );
+          })()}
+
           {/* Crypto Quick Stats */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4 sm:mb-6">
             <QuickStat icon={LineChart} label="Win Rate" value={cryptoData?.predictions?.stats?.winRate ? `${cryptoData.predictions.stats.winRate}%` : "0%"} color="text-accent-green" index={0} />
@@ -862,7 +1219,7 @@ export default function HomePage() {
 
             {/* Bot Status Card */}
             <GlassCard index={1} className="col-span-1">
-              <CardHeader icon={Zap} title="Bot Configuration" badge={botData?.bot?.status === "running" ? "🟢 LIVE" : "⚫ OFF"} />
+              <CardHeader icon={Zap} title="Bot Configuration" badge={botData?.bot?.status === "error" ? "🔴 ERROR" : botData?.bot?.status === "running" ? "🟢 LIVE" : "⚫ OFF"} />
               <div className="mt-3">
                 {/* Last Run Info */}
                 <div className="bg-white/[0.02] rounded-lg p-3 mb-4 border border-white/[0.03]">

@@ -45,6 +45,22 @@ function getStatus() {
     }
   } catch {}
 
+  // Bot last run
+  let lastRun = null;
+  let botAlerts: string[] = [];
+  try {
+    const botStatus = JSON.parse(fs.readFileSync(path.join(BOT_DIR, "bot-status.json"), "utf-8"));
+    lastRun = botStatus.lastRun;
+    if (botStatus.alerts) botAlerts = botStatus.alerts;
+  } catch {}
+
+  // Paper balance
+  let paperBalance = 1000;
+  try {
+    const config = JSON.parse(fs.readFileSync(path.join(BOT_DIR, "config.json"), "utf-8"));
+    paperBalance = config.paperBalance || 1000;
+  } catch {}
+
   return {
     mode,
     modeUpdatedAt,
@@ -58,6 +74,9 @@ function getStatus() {
       totalPnl: dailyState.totalPnl,
       openPositions: dailyState.openPositions,
     },
+    lastRun,
+    botAlerts,
+    paperBalance,
     limits: {
       maxStakePerTrade: 10,
       maxDailyLoss: 50,

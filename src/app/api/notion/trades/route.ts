@@ -80,6 +80,12 @@ export async function GET(request: Request) {
         pending++;
       }
       
+      // Extract mode from signals text [💰 REAL] or [📄 PAPER]
+      const mode = signals.includes('💰 REAL') ? 'real' : signals.includes('📄 PAPER') ? 'paper' : 'paper';
+      // Extract rejection reason if present
+      const rejectedMatch = signals.match(/REJECTED: (.+?)(\||$)/);
+      const rejectionReason = rejectedMatch ? rejectedMatch[1].trim() : null;
+
       return {
         id: page.id,
         name,
@@ -91,6 +97,8 @@ export async function GET(request: Request) {
         confidence,
         profit,
         signals,
+        mode,
+        rejectionReason,
         marketUrl,
         windowEnd,
         notionUrl: `https://notion.so/${page.id.replace(/-/g, '')}`,
@@ -113,40 +121,74 @@ export async function GET(request: Request) {
       }),
     });
     
-    const allTimeData = await allTimeRes.json();
-    let allWins = 0, allLosses = 0, allPending = 0, allPnl = 0;
-    
-    (allTimeData.results || []).forEach((page: any) => {
+    // Paginate through ALL trades for accurate all-time stats
+    let allTimeResults: any[] = [];
+    let hasMore = true;
+    let startCursor: string | undefined = undefined;
+    while (hasMore) {
+      const pageRes: Response = await fetch(`https://api.notion.com/v1/databases/${DATABASE_ID}/query`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${NOTION_API_KEY}`,
+          "Notion-Version": "2022-06-28",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          sorts: [{ property: "Window End", direction: "descending" }],
+          page_size: 100,
+          ...(startCursor ? { start_cursor: startCursor } : {}),
+        }),
+      });
+      const allTimeData = await pageRes.json();
+      allTimeResults = allTimeResults.concat(allTimeData.results || []);
+      hasMore = allTimeData.has_more;
+      startCursor = allTimeData.next_cursor;
+    }
+
+    const modeStats: Record<string, { wins: number; losses: number; pending: number; pnl: number }> = {
+      all: { wins: 0, losses: 0, pending: 0, pnl: 0 },
+      paper: { wins: 0, losses: 0, pending: 0, pnl: 0 },
+      real: { wins: 0, losses: 0, pending: 0, pnl: 0 },
+    };
+
+    allTimeResults.forEach((page: any) => {
       const props = page.properties;
       const result = props?.Result?.select?.name || "Pending";
       const stake = props?.Stake?.number || 10;
       const odds = props?.["Entry Odds"]?.number || 0.5;
-      
+      const signals = props?.Signals?.rich_text?.[0]?.plain_text || "";
+      const mode = signals.includes('💰 REAL') ? 'real' : 'paper';
+
+      let profit = 0;
       if (result === "Win") {
-        allWins++;
-        allPnl += stake * (1 - odds) / odds;
+        profit = stake * (1 - odds) / odds;
+        modeStats.all.wins++; modeStats[mode].wins++;
+        modeStats.all.pnl += profit; modeStats[mode].pnl += profit;
       } else if (result === "Loss") {
-        allLosses++;
-        allPnl -= stake;
+        profit = -stake;
+        modeStats.all.losses++; modeStats[mode].losses++;
+        modeStats.all.pnl += profit; modeStats[mode].pnl += profit;
       } else {
-        allPending++;
+        modeStats.all.pending++; modeStats[mode].pending++;
       }
     });
 
-    const allTimeWinRate = allWins + allLosses > 0 ? (allWins / (allWins + allLosses) * 100).toFixed(1) : "N/A";
+    const buildStats = (s: typeof modeStats.all) => ({
+      wins: s.wins,
+      losses: s.losses,
+      pending: s.pending,
+      pnl: s.pnl.toFixed(2),
+      winRate: s.wins + s.losses > 0 ? (s.wins / (s.wins + s.losses) * 100).toFixed(1) : "N/A",
+      total: s.wins + s.losses + s.pending,
+    });
 
     return NextResponse.json({ 
       trades, 
       date: targetDate,
       stats: { wins, losses, pending, pnl: pnl.toFixed(2), winRate },
-      allTime: { 
-        wins: allWins, 
-        losses: allLosses, 
-        pending: allPending, 
-        pnl: allPnl.toFixed(2), 
-        winRate: allTimeWinRate,
-        total: allWins + allLosses + allPending
-      },
+      allTime: buildStats(modeStats.all),
+      allTimePaper: buildStats(modeStats.paper),
+      allTimeReal: buildStats(modeStats.real),
       timestamp: new Date().toISOString() 
     });
   } catch (error: any) {

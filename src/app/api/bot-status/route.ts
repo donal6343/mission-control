@@ -22,6 +22,11 @@ export async function GET() {
       lastStatus = botStatus.status;
       nextRun = botStatus.nextRun;
       thresholds = botStatus.thresholds;
+      var stakeTiersFromBot = botStatus.stakeTiers;
+      var consecutiveErrors = botStatus.consecutiveErrors || 0;
+      var lastSuccessfulRun = botStatus.lastSuccessfulRun || null;
+      var erroringSince = botStatus.erroringSince || null;
+      var lastError = botStatus.lastError || null;
     } catch {
       // Fall back to crons.json
       try {
@@ -44,48 +49,105 @@ export async function GET() {
       } catch {}
     }
 
-    // Decision paths logic
+    // Read trading config for path enabled states
+    let tradingConfig: any = { paths: {} };
+    try {
+      tradingConfig = JSON.parse(await readFile(join(POLYMARKET_PATH, "trading-config.json"), "utf-8"));
+    } catch {}
+
+    // Decision paths — read dynamically from bot thresholds
+    const pc = tradingConfig.paths || {};
     const decisionPaths = [
-      { name: "🎰 ARB", requirement: `Price move >${((thresholds?.arbMinPriceMove || 0.003) * 100).toFixed(1)}% + odds lag >${((thresholds?.arbMinDiscrepancy || 0.02) * 100).toFixed(0)}%` },
-      { name: "⚡ Breaking News", requirement: `News detected + ${((thresholds?.breakingNewsMinConfidence || 0.55) * 100).toFixed(0)}%+ conf` },
-      { name: "🔥 Massive Edge", requirement: "30%+ edge + any 1 signal" },
-      { name: "💰 High Edge", requirement: "20%+ edge + 2 signals" },
-      { name: "Path 1", requirement: `${((thresholds?.path1?.confidence || 0.55) * 100).toFixed(0)}%+ conf + ${thresholds?.path1?.categories || 3} signals` },
-      { name: "Path 2", requirement: `${((thresholds?.path2?.confidence || 0.60) * 100).toFixed(0)}%+ conf + ${thresholds?.path2?.categories || 2} signals` },
-      { name: "Path 3", requirement: `${((thresholds?.path3?.confidence || 0.70) * 100).toFixed(0)}%+ conf + ${thresholds?.path3?.categories || 1} signal` },
+      { name: "🎰 ARB", key: "arb", requirement: `Price move >${((thresholds?.arbMinPriceMove || 0.003) * 100).toFixed(1)}% + odds lag >${((thresholds?.arbMinDiscrepancy || 0.02) * 100).toFixed(0)}% + conf ≥45%`, type: "bypass", enabled: pc.arb?.enabled !== false },
+      { name: "⚡ Breaking News", key: "breakingNews", requirement: `News detected + ${((thresholds?.breakingNewsMinConfidence || 0.60) * 100).toFixed(0)}%+ conf + price confirmation`, type: "bypass", enabled: pc.breakingNews?.enabled !== false },
+      { name: "Path 1", key: "path1", requirement: `${thresholds?.path1?.categories || 3} signals + ${((thresholds?.minEdge || 0.03) * 100).toFixed(0)}%+ edge (min ${((thresholds?.path1?.confidence || 0.50) * 100).toFixed(0)}% conf)`, type: "signal", enabled: pc.path1?.enabled !== false },
+      { name: "Path 2", key: "path2", requirement: `${thresholds?.path2?.categories || 2} signals + ${((thresholds?.minEdge || 0.03) * 100).toFixed(0)}%+ edge (min ${((thresholds?.path2?.confidence || 0.55) * 100).toFixed(0)}% conf)`, type: "signal", enabled: pc.path2?.enabled !== false },
+      { name: "Path 3", key: "path3", requirement: `${thresholds?.path3?.categories || 1} signal + ${((thresholds?.minEdge || 0.03) * 100).toFixed(0)}%+ edge (min ${((thresholds?.path3?.confidence || 0.65) * 100).toFixed(0)}% conf)`, type: "signal", enabled: pc.path3?.enabled !== false },
+      { name: "🐋 Whale", key: "whale", requirement: "Whale flow agrees with direction + min edge (testing mode)", type: "whale", enabled: pc.whale?.enabled !== false },
     ];
 
+    // Asset weights — set dynamically by macro sentiment bot
+    const dynamicWeights = tradingConfig.assetWeights || {};
+    const macroUpdate = tradingConfig.macroUpdate || {};
+    const allAssets = ['BTC', 'ETH', 'SOL', 'XRP'];
+    const assetConfig = allAssets.map(asset => {
+      const weight = dynamicWeights[asset] !== undefined ? dynamicWeights[asset] : (thresholds?.assetWeights?.[asset] || 0);
+      const macroResult = macroUpdate.results?.[asset];
+      return {
+        asset,
+        weight,
+        sentiment: weight > 0.01 ? "bullish" : weight < -0.01 ? "bearish" : "neutral",
+        excluded: (thresholds?.excludedAssets || []).includes(asset),
+        macro: macroResult ? {
+          priceTrend: macroResult.price?.trend,
+          momentum4h: macroResult.price?.momentum4h,
+          sentimentRaw: macroResult.sentiment?.reason,
+        } : null,
+      };
+    });
+
     const signalCategories = [
-      { name: "Technical", description: "RSI extremes, momentum" },
-      { name: "Odds", description: "Contrarian value" },
-      { name: "Sentiment", description: "Grok analysis" },
-      { name: "Correlation", description: "BTC leads alts" },
-      { name: "Breaking", description: "News detected" },
-      { name: "ARB", description: "Price-odds discrepancy" },
+      { name: "Technical", description: "RSI extremes, VWAP deviation, ATR volatility" },
+      { name: "Momentum", description: "Price momentum over window" },
+      { name: "Sentiment", description: "Grok X/Twitter analysis" },
+      { name: "Correlation", description: "BTC move triggers alt bets" },
+      { name: "Breaking News", description: "Market-moving news (with quality gates)" },
+      { name: "ARB", description: "Price moved but odds haven't caught up" },
     ];
 
     const safetyRails = [
-      { rule: "Min market odds", value: "35%" },
-      { rule: "Min edge required", value: `${((thresholds?.minEdge || 0.05) * 100).toFixed(0)}%` },
+      { rule: "Min market odds", value: `${((thresholds?.minMarketOdds || 0.40) * 100).toFixed(0)}%` },
+      { rule: "Min edge required", value: `${((thresholds?.minEdge || 0.03) * 100).toFixed(0)}%` },
       { rule: "No duplicate bets", value: "Same market window" },
-      { rule: "Time buffer", value: "Skip if <5 mins left" },
+      { rule: "News cooldown", value: `${((thresholds?.breakingNewsCooldownMs || 900000) / 60000).toFixed(0)} min per asset` },
+      { rule: "News rate limit", value: `${thresholds?.breakingNewsMaxPerHour || 3}/hr max` },
+      { rule: "Excluded assets", value: (thresholds?.excludedAssets || []).join(", ") || "None" },
     ];
+
+    // Read wallet status
+    let walletStatus: any = null;
+    try {
+      walletStatus = JSON.parse(await readFile(join(POLYMARKET_PATH, "wallet-status.json"), "utf-8"));
+    } catch {}
+
+    // Determine actual health status
+    const isStale = lastRun && (Date.now() - new Date(lastRun).getTime() > 120000); // >2min since last run
+    const isErroring = lastStatus === 'error' && consecutiveErrors > 0;
+    const healthStatus = isErroring ? "error" : isStale ? "stale" : "running";
 
     const botStatusResponse = {
       name: "Polymarket 15M V2",
       cronId: POLYMARKET_CRON_ID,
-      status: "running",
+      status: healthStatus,
       schedule: "Every 5 minutes",
       lastRun,
       lastStatus,
       lastDuration,
       nextRun,
+      wallet: walletStatus ? {
+        address: walletStatus.address,
+        pol: walletStatus.pol,
+        usdc: walletStatus.usdc,
+        lastChecked: walletStatus.timestamp,
+      } : null,
+      health: {
+        consecutiveErrors: consecutiveErrors || 0,
+        lastSuccessfulRun: lastSuccessfulRun || null,
+        erroringSince: erroringSince || null,
+        lastError: lastError || null,
+      },
       description: "Edge-first value betting with multi-signal confirmation",
       logic: {
         decisionPaths,
         signalCategories,
         safetyRails,
-        currentMode: "Trial Mode (looser thresholds for data collection)",
+        assetConfig,
+        stakeTiers: tradingConfig.stakeTiers || stakeTiersFromBot || [],
+        params: tradingConfig.params || {},
+        killSwitch: tradingConfig.killSwitch || false,
+        excludedAssets: tradingConfig.excludedAssets || thresholds?.excludedAssets || [],
+        currentMode: "Week 2 — Optimised settings + fair odds fix",
+        fairOddsFormula: "50% + (signal_strength / 6) × 30% → range 50-80%",
       }
     };
 
