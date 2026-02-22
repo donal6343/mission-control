@@ -2,44 +2,55 @@
   "paths": {
     "arb": {
       "enabled": true,
-      "label": "🎰 ARB"
+      "label": "🎰 ARB",
+      "mode": "real"
     },
     "breakingNews": {
       "enabled": true,
-      "label": "⚡ Breaking News"
+      "label": "⚡ Breaking News",
+      "mode": "real"
     },
     "path1": {
       "enabled": true,
-      "label": "Path 1"
+      "label": "Path 1",
+      "mode": "real"
     },
     "path2": {
       "enabled": true,
-      "label": "Path 2"
+      "label": "Path 2",
+      "mode": "real"
     },
     "path3": {
       "enabled": true,
-      "label": "Path 3"
+      "label": "Path 3",
+      "mode": "real"
     },
     "whale": {
       "enabled": false,
-      "label": "🐋 Whale"
+      "label": "🐋 Whale",
+      "mode": "paper"
+    },
+    "macro": {
+      "enabled": true,
+      "label": "📅 Macro",
+      "mode": "paper"
     }
   },
   "killSwitch": false,
   "stakeTiers": [
     {
       "minConf": 0.75,
-      "stake": 15,
+      "stake": 20,
       "label": "75%+"
     },
     {
       "minConf": 0.7,
-      "stake": 10,
+      "stake": 15,
       "label": "70-74%"
     },
     {
       "minConf": 0.6,
-      "stake": 5,
+      "stake": 10,
       "label": "60-69%"
     },
     {
@@ -68,8 +79,7 @@
     "path3Categories": 1
   },
   "excludedAssets": [
-    "XRP",
-    "SOL"
+    "XRP"
   ],
   "assetWeights": {
     "BTC": 0,
@@ -77,17 +87,17 @@
     "SOL": 0
   },
   "macroUpdate": {
-    "timestamp": "2026-02-22T12:01:23.440Z",
+    "timestamp": "2026-02-22T20:00:12.100Z",
     "results": {
       "BTC": {
         "price": {
           "trend": "neutral",
-          "score": 0.09,
-          "momentum4h": "0.07%",
+          "score": -0.02,
+          "momentum4h": "-0.08%",
           "trend24h": "N/A",
-          "consistency": "26%",
-          "latestPrice": 68219.18,
-          "reason": "4h: 0.07%, 24h: N/A, consistency: 26%"
+          "consistency": "0%",
+          "latestPrice": 67390.14,
+          "reason": "4h: -0.08%, 24h: N/A, consistency: 0%"
         },
         "sentiment": {
           "sentiment": "neutral",
@@ -102,12 +112,12 @@
       "ETH": {
         "price": {
           "trend": "neutral",
-          "score": 0.07,
-          "momentum4h": "0.08%",
+          "score": -0.01,
+          "momentum4h": "-0.06%",
           "trend24h": "N/A",
-          "consistency": "19%",
-          "latestPrice": 1981.15,
-          "reason": "4h: 0.08%, 24h: N/A, consistency: 19%"
+          "consistency": "0%",
+          "latestPrice": 1943.09,
+          "reason": "4h: -0.06%, 24h: N/A, consistency: 0%"
         },
         "sentiment": {
           "sentiment": "neutral",
@@ -122,12 +132,12 @@
       "SOL": {
         "price": {
           "trend": "neutral",
-          "score": -0.1,
-          "momentum4h": "-0.13%",
+          "score": 0.02,
+          "momentum4h": "0.00%",
           "trend24h": "N/A",
-          "consistency": "26%",
-          "latestPrice": 85.23,
-          "reason": "4h: -0.13%, 24h: N/A, consistency: 26%"
+          "consistency": "5%",
+          "latestPrice": 83.27,
+          "reason": "4h: 0.00%, 24h: N/A, consistency: 5%"
         },
         "sentiment": {
           "sentiment": "neutral",
@@ -141,6 +151,6 @@
       }
     }
   },
-  "updatedAt": "2026-02-22T15:24:08.144Z",
+  "updatedAt": "2026-02-22T21:51:30.834Z",
   "updatedBy": "dashboard"
 }

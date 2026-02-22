@@ -18,7 +18,13 @@ const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 
-// (Proxy interceptor removed — using direct CLOB URL now)
+// Inject proxy secret header on all requests to EU proxy
+axios.interceptors.request.use((config) => {
+  if (config.url && config.url.includes('3.254.181.103')) {
+    config.headers['x-proxy-secret'] = 'aab23c2b98dd2ac874f0dd1ec73ca1d2';
+  }
+  return config;
+});
 
 // ========== CONFIG ==========
 const REAL_CONFIG = {
@@ -29,13 +35,13 @@ const REAL_CONFIG = {
   },
   
   // Safety limits
-  maxStakePerTrade: 10,       // $10 max per trade
+  maxStakePerTrade: 20,       // $20 max per trade
   maxDailyLoss: 50,           // Stop trading if down $50 in a day
   maxDailyTrades: 30,         // Max trades per day
   maxConcurrentPositions: 20, // Max open positions at once (15-min markets resolve fast)
   
   // Polymarket CLOB (via EU proxy to bypass US geo-block)
-  clobUrl: 'https://clob.polymarket.com',  // Direct — server not geo-blocked
+  clobUrl: 'http://3.254.181.103:3001',  // EU proxy — direct URL is geo-blocked for order placement
   chainId: 137, // Polygon
   
   // Paths
@@ -147,7 +153,7 @@ function loadWallet() {
 }
 
 // ========== CLOB CLIENT ==========
-let _cachedApiCreds = null;
+let _cachedApiCreds = null;  // Reset on restart — proxy URL changed
 let _cachedApiCredsAt = 0;
 const API_CREDS_TTL = 3600000; // Re-derive every hour
 
@@ -436,25 +442,119 @@ async function executeRealTradeTaker(trade) {
     
     const stake = Math.min(trade.stake || 10, REAL_CONFIG.maxStakePerTrade);
     
-    // Use exact same approach as working test-order.js:
-    // Limit order at entry odds — fills immediately as taker at market price
-    const rawPrice = trade.entryOdds || 0.5;
-    const price = Math.min(0.99, Math.max(0.01, Math.round(rawPrice * 100) / 100)); // Clamp to valid range & round to tick
-    const size = Math.round(stake / price * 100) / 100; // Shares
+    // === STEP 1: Get real CLOB midpoint price ===
+    // Gamma API can diverge from real market (seen 52% vs 24%). Use CLOB /midpoint endpoint.
+    const axios = require('axios');
+    let clobMid = null;
+    try {
+      const midResp = await axios.get('https://clob.polymarket.com/midpoint', {
+        params: { token_id: tokenId }, timeout: 5000
+      });
+      const mid = midResp.data?.mid ?? midResp.data?.price;
+      const midNum = typeof mid === 'string' ? parseFloat(mid) : mid;
+      if (isFinite(midNum) && midNum > 0 && midNum < 1) {
+        clobMid = midNum;
+      }
+    } catch (e) {
+      console.log(`   ⚠️  CLOB midpoint fetch failed: ${e.message}`);
+    }
     
-    if (size <= 0) return { success: false, reason: `Invalid size: ${size} (stake=$${stake}, price=${price})` };
+    const effectivePrice = clobMid || trade.entryOdds || 0.5;
+    console.log(`   📊 Prices: gamma=${trade.entryOdds} | CLOB mid=${clobMid || 'n/a'} | using=${effectivePrice.toFixed(3)}`);
     
-    console.log(`   💰 ORDER: ${trade.asset} ${trade.direction} | $${stake} @ ${price} | ${size} shares | Token: ${tokenId.slice(0, 12)}...`);
+    // Sanity checks using real CLOB mid
+    if (clobMid !== null) {
+      if (clobMid < 0.40) {
+        return { success: false, reason: `CLOB mid ${(clobMid*100).toFixed(0)}% below 40% min (gamma said ${(trade.entryOdds*100).toFixed(0)}%)` };
+      }
+      if (Math.abs(clobMid - trade.entryOdds) > 0.15) {
+        return { success: false, reason: `Price divergence: CLOB mid ${(clobMid*100).toFixed(0)}% vs gamma ${(trade.entryOdds*100).toFixed(0)}% (>15pp)` };
+      }
+    }
     
-    const order = await client.createAndPostOrder({
-      tokenID: tokenId,
-      price: price,
-      side: 'BUY',
-      size: size,
-      feeRateBps: 1000,
-      tickSize: '0.01',
-      negRisk: false,
-    });
+    // === STEP 2: FOK market order — let SDK walk the book ===
+    // SDK's createMarketOrder (without price) calls calculateBuyMarketPrice which walks
+    // the full order book and sets price high enough to cover our entire amount across
+    // all ask levels. Previously we manually set price=bestAsk which limited fills to
+    // a single price level — causing FOK rejections when that level had insufficient depth.
+    const MAX_RETRIES = 3;
+    let orderId = null;
+    let fillPrice = null;
+    let totalFilled = 0;
+    
+    // Price cap: signal + 10pp — SDK walks the book and fills at best available asks
+    // The actual fill price comes from position data lookup after fill (not the cap)
+    const MAX_SLIPPAGE_PP = 0.10;
+    const priceCap = Math.min(trade.entryOdds + MAX_SLIPPAGE_PP, 0.95);
+    console.log(`   📊 Signal: ${(trade.entryOdds*100).toFixed(1)}% | Price cap: ${(priceCap*100).toFixed(1)}% (signal + ${MAX_SLIPPAGE_PP*100}pp)`);
+    
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      try {
+        console.log(`   💰 Market FOK attempt ${attempt + 1}: ${trade.asset} ${trade.direction} | $${stake} | Token: ${tokenId.slice(0, 12)}...`);
+        
+        // Use tight price cap based on actual best ask
+        const order = await client.createMarketOrder({
+          tokenID: tokenId,
+          amount: stake,
+          price: priceCap,
+          side: 'BUY',
+          feeRateBps: 1000,
+        }, {
+          tickSize: '0.01',
+          negRisk: false,
+        });
+        
+        const resp = await client.postOrder(order, OrderType.FOK);
+        console.log(`   📋 RESPONSE: ${JSON.stringify(resp)?.slice(0, 300)}`);
+        
+        if (resp?.success === true || resp?.orderID || resp?.id) {
+          orderId = resp?.orderID || resp?.id;
+          totalFilled = stake;
+          // Get actual fill price from position data (exchange fills at best asks, not our cap)
+          fillPrice = trade.entryOdds; // Default to signal price (not priceCap which overstates cost)
+          const walletAddr = loadWallet()?.address;
+          for (let pAttempt = 0; pAttempt < 3; pAttempt++) {
+            try {
+              await new Promise(r => setTimeout(r, 3000)); // Wait for position data to propagate
+              const posResp = await axios.get('https://data-api.polymarket.com/positions', {
+                params: { user: walletAddr }, timeout: 10000
+              });
+              const pos = (posResp.data || []).find(p => p.asset === tokenId);
+              if (pos?.avgPrice) {
+                fillPrice = pos.avgPrice;
+                console.log(`   📊 Actual fill price: ${(fillPrice*100).toFixed(1)}% (from position data, attempt ${pAttempt+1})`);
+                break;
+              }
+              console.log(`   ⏳ Position not found yet (attempt ${pAttempt+1}/3)...`);
+            } catch (e) {
+              console.log(`   ⚠️  Position fetch error (attempt ${pAttempt+1}): ${e.message}`);
+            }
+          }
+          console.log(`   ✅ FILLED: $${stake} @ ${fillPrice?.toFixed(4)} | order: ${orderId}`);
+          break;
+        } else {
+          console.log(`   ⚠️  FOK rejected (attempt ${attempt + 1}/${MAX_RETRIES}): ${JSON.stringify(resp)?.slice(0, 200)}`);
+          if (attempt < MAX_RETRIES - 1) await new Promise(r => setTimeout(r, 2000));
+        }
+      } catch (e) {
+        console.log(`   ❌ Attempt ${attempt + 1} error: ${e.message}`);
+        if (e.message.includes('insufficient') || e.message.includes('allowance')) {
+          activateKillSwitch(`Trade failed: ${e.message}`);
+          return { success: false, reason: e.message };
+        }
+        // "no match" means book has insufficient total depth for our amount — don't retry
+        if (e.message.includes('no match')) {
+          return { success: false, reason: `Insufficient book depth for $${stake}` };
+        }
+        if (attempt < MAX_RETRIES - 1) await new Promise(r => setTimeout(r, 2000));
+      }
+    }
+    
+    if (totalFilled === 0) {
+      return { success: false, reason: `Failed to fill after ${MAX_RETRIES} attempts` };
+    }
+    
+    console.log(`   ✅ ORDER COMPLETE: $${totalFilled.toFixed(2)} | ${orderId}`);
     
     state.tradesPlaced++;
     state.openPositions++;
@@ -462,15 +562,18 @@ async function executeRealTradeTaker(trade) {
       timestamp: new Date().toISOString(),
       asset: trade.asset,
       direction: trade.direction,
-      stake, tokenId,
-      orderId: order?.orderID || order?.id || 'unknown',
+      stake: totalFilled, tokenId,
+      orderId: orderId || 'fok-multi',
       entryOdds: trade.entryOdds,
+      clobMid,
+      fillPrice,
       slug: trade.slug,
-      orderType: 'taker',
+      orderType: 'fok-taker',
     });
     saveDailyState(state);
     
-    return { success: true, orderId: order?.orderID || order?.id, stake, tokenId, orderType: 'taker' };
+    const slippage = fillPrice ? Math.round((fillPrice - effectivePrice) * 10000) / 100 : 0;
+    return { success: true, orderId: orderId || 'fok-multi', stake: totalFilled, tokenId, orderType: 'fok-taker', fillPrice, limitPrice: priceCap, clobMid, slippage };
   } catch (error) {
     console.error(`   ❌ TAKER TRADE FAILED: ${error.message}`);
     if (error.message.includes('insufficient') || error.message.includes('allowance')) {

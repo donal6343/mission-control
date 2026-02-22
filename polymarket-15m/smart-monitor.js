@@ -350,24 +350,54 @@ function calculateIndicators(history, asset) {
 }
 
 // ========== GROK SENTIMENT ==========
-async function getGrokSentiment() {
+// Grok sentiment cache — fetched once per window, not every 30s cycle
+let _grokCache = { data: {}, fetchedAt: 0, windowKey: '' };
+const GROK_CACHE_TTL = 10 * 60 * 1000; // 10 min TTL (covers one full window + buffer)
+
+async function getGrokSentiment(windowKey = '') {
+  // Return cached if same window or recent enough
+  if (_grokCache.data && Object.keys(_grokCache.data).length > 0) {
+    const age = Date.now() - _grokCache.fetchedAt;
+    if (age < GROK_CACHE_TTL) {
+      console.log(`   📦 Using cached Grok sentiment (${Math.round(age/1000)}s old)`);
+      return _grokCache.data;
+    }
+  }
+  
   return new Promise((resolve) => {
     try {
+      console.log('   🔄 Fetching fresh Grok sentiment...');
       const result = execSync(
         'cd ~/clawd/polymarket-15m && source ~/clawd/trueshot/.venv/bin/activate && python3 grok-analyzer.py 2>&1',
         { timeout: 45000, encoding: 'utf-8', shell: '/bin/bash' }
       );
       const jsonMatch = result.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
-        resolve(JSON.parse(jsonMatch[0]));
+        const data = JSON.parse(jsonMatch[0]);
+        _grokCache = { data, fetchedAt: Date.now(), windowKey };
+        resolve(data);
       } else {
-        resolve({});
+        resolve(_grokCache.data || {}); // Fallback to old cache
       }
     } catch (error) {
-      console.log('⚠️  Grok analysis unavailable');
-      resolve({});
+      console.log('⚠️  Grok analysis unavailable, using cache');
+      resolve(_grokCache.data || {});
     }
   });
+}
+
+// Fetch CLOB midpoint for a token — the REAL market price
+async function getClobMidpoint(tokenId) {
+  try {
+    const axios = require('axios');
+    const resp = await axios.get('https://clob.polymarket.com/midpoint', {
+      params: { token_id: tokenId }, timeout: 3000
+    });
+    const raw = resp.data?.mid ?? resp.data?.price;
+    const mid = typeof raw === 'string' ? parseFloat(raw) : raw;
+    if (isFinite(mid) && mid > 0 && mid < 1) return mid;
+  } catch (e) {}
+  return null;
 }
 
 // ========== GENERATE SIGNAL WITH VALUE CALCULATION ==========
@@ -707,6 +737,7 @@ function shouldBet(signal) {
     
     return { 
       bet: true, 
+      path: 'arb',
       reason: `🎰 ARB: Price ${arbOpportunity.priceMove > 0 ? '+' : ''}${(arbOpportunity.priceMove*100).toFixed(2)}%, odds lag ${(arbOpportunity.discrepancy*100).toFixed(1)}%${confirmTag}${whaleTag}`,
       arbConfirmed: scoreAgrees,
       whaleConfirmed,
@@ -757,7 +788,7 @@ function shouldBet(signal) {
     
     // All gates passed — record and trade
     recordNewsTrade(asset, newsSummary, newsState);
-    return { bet: true, reason: `⚡ BREAKING NEWS (${(confidence*100).toFixed(0)}% conf, price-confirmed)` };
+    return { bet: true, path: 'breakingNews', reason: `⚡ BREAKING NEWS (${(confidence*100).toFixed(0)}% conf, price-confirmed)` };
   }
   
   // Dynamic parameters from dashboard
@@ -777,13 +808,13 @@ function shouldBet(signal) {
   // ===== ORIGINAL PATHS (raw edge — no asset weight) =====
   if (edge >= minEdge) {
     if (isPathEnabled('path1') && confidence >= p1Conf && categoryCount >= p1Cats) {
-      return { bet: true, reason: `Path1: ${categoryCount} categories, ${(confidence*100).toFixed(0)}% conf, ${(edge*100).toFixed(1)}% edge` };
+      return { bet: true, path: 'path1', reason: `Path1: ${categoryCount} categories, ${(confidence*100).toFixed(0)}% conf, ${(edge*100).toFixed(1)}% edge` };
     }
     if (isPathEnabled('path2') && confidence >= p2Conf && categoryCount >= p2Cats) {
-      return { bet: true, reason: `Path2: ${categoryCount} categories, ${(confidence*100).toFixed(0)}% conf, ${(edge*100).toFixed(1)}% edge` };
+      return { bet: true, path: 'path2', reason: `Path2: ${categoryCount} categories, ${(confidence*100).toFixed(0)}% conf, ${(edge*100).toFixed(1)}% edge` };
     }
     if (isPathEnabled('path3') && confidence >= p3Conf && categoryCount >= p3Cats) {
-      return { bet: true, reason: `Path3: High conviction (${(confidence*100).toFixed(0)}%), ${(edge*100).toFixed(1)}% edge` };
+      return { bet: true, path: 'path3', reason: `Path3: High conviction (${(confidence*100).toFixed(0)}%), ${(edge*100).toFixed(1)}% edge` };
     }
   }
   
@@ -791,13 +822,13 @@ function shouldBet(signal) {
   if (assetBonus !== 0 && adjustedEdge >= minEdge) {
     const wTag = `${asset} ${assetBonus > 0 ? '+' : ''}${(assetBonus*100).toFixed(0)}%`;
     if (isPathEnabled('path1') && confidence >= p1Conf && categoryCount >= p1Cats) {
-      return { bet: true, reason: `Path1W[${wTag}]: ${categoryCount} categories, ${(confidence*100).toFixed(0)}% conf, ${(adjustedEdge*100).toFixed(1)}% edge` };
+      return { bet: true, path: 'path1', reason: `Path1W[${wTag}]: ${categoryCount} categories, ${(confidence*100).toFixed(0)}% conf, ${(adjustedEdge*100).toFixed(1)}% edge` };
     }
     if (isPathEnabled('path2') && confidence >= p2Conf && categoryCount >= p2Cats) {
-      return { bet: true, reason: `Path2W[${wTag}]: ${categoryCount} categories, ${(confidence*100).toFixed(0)}% conf, ${(adjustedEdge*100).toFixed(1)}% edge` };
+      return { bet: true, path: 'path2', reason: `Path2W[${wTag}]: ${categoryCount} categories, ${(confidence*100).toFixed(0)}% conf, ${(adjustedEdge*100).toFixed(1)}% edge` };
     }
     if (isPathEnabled('path3') && confidence >= p3Conf && categoryCount >= p3Cats) {
-      return { bet: true, reason: `Path3W[${wTag}]: High conviction (${(confidence*100).toFixed(0)}%), ${(adjustedEdge*100).toFixed(1)}% edge` };
+      return { bet: true, path: 'path3', reason: `Path3W[${wTag}]: High conviction (${(confidence*100).toFixed(0)}%), ${(adjustedEdge*100).toFixed(1)}% edge` };
     }
   }
   
@@ -888,8 +919,22 @@ async function checkMacroTrades(markets, currentPrices) {
 // ========== LOG TRADE TO NOTION ==========
 async function logTrade(trade) {
   try {
-    // Determine trade mode tag
-    const mode = readTradingMode();
+    // Determine trade mode — per-strategy from trading-config, with global override
+    const globalMode = readTradingMode();
+    const tradingConfig = loadTradingConfig();
+    const tradePath = trade.path || (trade.signalDetails?.isMacro ? 'macro' : 'path2'); // fallback
+    const pathConfig = tradingConfig.paths?.[tradePath];
+    // Strategy mode: use path-level mode if set, otherwise fall back to global
+    // Global 'off' always wins. Global 'paper' overrides path 'real'.
+    let mode;
+    if (globalMode === 'off') {
+      mode = 'off';
+    } else if (pathConfig?.mode) {
+      // Path has explicit mode — use it (unless global is 'paper' which overrides)
+      mode = globalMode === 'paper' ? 'paper' : pathConfig.mode;
+    } else {
+      mode = globalMode; // No path mode set, use global
+    }
     const modeTag = mode === 'real' && !isKillSwitchActive() ? '💰 REAL' : '📄 PAPER';
     
     // Always log to Notion (paper trade record)
@@ -926,8 +971,10 @@ async function logTrade(trade) {
       console.log(`   💰 REAL MODE — executing on Polymarket...`);
       realResult = await executeRealTradeTaker({ ...trade, stake });
       if (realResult.success) {
-        console.log(`   ✅ REAL ORDER: ${realResult.orderId} | $${stake}`);
-        executionNote = ` | ORDER: ${realResult.orderId}`;
+        console.log(`   ✅ REAL ORDER: ${realResult.orderId} | $${stake} | fill: ${realResult.fillPrice} | cap: ${realResult.limitPrice} | slippage: ${realResult.slippage}%`);
+        executionNote = ` | ORDER: ${realResult.orderId} | Fill: ${realResult.fillPrice} | Cap: ${realResult.limitPrice} | Slippage: ${realResult.slippage}%`;
+        
+        // Auto-redeem handled in main loop (checks every cycle, survives restarts)
       } else {
         console.log(`   ❌ REAL ORDER REJECTED: ${realResult.reason}`);
         tradeStatus = 'Rejected';
@@ -939,11 +986,13 @@ async function logTrade(trade) {
     const notionPage = await notion.pages.create({
       parent: { database_id: config.notionDatabaseId },
       properties: {
-        'Name': { title: [{ text: { content: `${trade.asset} ${trade.direction} @ ${(trade.entryOdds * 100).toFixed(1)}%` } }] },
+        'Name': { title: [{ text: { content: `${trade.asset} ${trade.direction} @ ${((realResult?.fillPrice || realResult?.clobMid || trade.entryOdds) * 100).toFixed(1)}%` } }] },
         'Asset': { select: { name: trade.asset } },
         'Direction': { select: { name: trade.direction } },
-        'Entry Odds': { number: trade.entryOdds },
-        'Stake': { number: stake },
+        'Entry Odds': { number: realResult?.fillPrice || realResult?.clobMid || trade.entryOdds },
+        'Stake': { number: realResult?.stake || stake },
+        'Signal Odds': { number: trade.entryOdds },
+        'Execution Time': { date: { start: new Date().toISOString() } },
         'Result': { select: { name: tradeStatus } },
         'Confidence': { number: trade.confidence || 0 },
         'Market URL': { url: `https://polymarket.com/event/${trade.slug}` },
@@ -1058,10 +1107,28 @@ async function monitor() {
     }
   }
   
-  // Get Grok sentiment
+  // Get Grok sentiment (cached per window — only fetches fresh if >10min old)
   console.log('\n🤖 Fetching Grok sentiment...');
   const sentiment = await getGrokSentiment();
   global._lastSentiment = sentiment;  // Make accessible to shouldBet for news dedup
+  
+  // Fetch CLOB midpoints for real market prices (gamma can lag significantly)
+  console.log('📊 Fetching CLOB midpoints...');
+  for (const market of markets) {
+    if (market.clobTokenIds && market.clobTokenIds.length >= 2) {
+      const [upMid, downMid] = await Promise.all([
+        getClobMidpoint(market.clobTokenIds[0]),
+        getClobMidpoint(market.clobTokenIds[1])
+      ]);
+      if (upMid !== null) {
+        const gammaUp = market.upOdds;
+        market.upOdds = upMid;
+        market.downOdds = downMid || (1 - upMid);
+        market._gammaOdds = gammaUp; // Keep gamma for reference
+        console.log(`   ${market.asset}: CLOB ${(upMid*100).toFixed(0)}% (gamma was ${(gammaUp*100).toFixed(0)}%)`);
+      }
+    }
+  }
   
   // Update odds history
   for (const market of markets) {
@@ -1125,8 +1192,8 @@ async function monitor() {
       
       const windowStart = new Date(market.startTime);
       const minsElapsed = (now - windowStart) / 1000 / 60;
-      if (minsElapsed < 2) {
-        console.log(`      ⏱️  Skipping - only ${minsElapsed.toFixed(1)} mins in (need 2+ mins for odds to settle)`);
+      if (minsElapsed < 0.5) {
+        console.log(`      ⏱️  Skipping - only ${minsElapsed.toFixed(1)} mins in (need 30s for market to open)`);
       } else if (minsRemaining < 5) {
         console.log(`      ⏱️  Skipping - only ${minsRemaining.toFixed(1)} mins left`);
       } else if (hasAlreadyBet(market.slug)) {
@@ -1162,6 +1229,7 @@ async function monitor() {
           signalTypes: signal.signalTypes,
           sentimentDetail,
           reason: decision.reason,
+          path: decision.path || 'unknown',
           // Detailed signal breakdown for analysis
           signalDetails: {
             score: signal.score,
@@ -1357,6 +1425,17 @@ if (require.main === module) {
             await checkResults();
           } catch (e) {
             console.log('⚠️  Results check skipped');
+          }
+        }
+        // Auto-redeem: check every cycle for redeemable positions
+        // Only actually calls chain if positions are found (cheap API check first)
+        if (!global._lastRedeemCheck || Date.now() - global._lastRedeemCheck > 60000) {
+          global._lastRedeemCheck = Date.now();
+          try {
+            const { autoRedeem } = require('./auto-redeem.js');
+            await autoRedeem();
+          } catch (e) {
+            console.log('⚠️  Auto-redeem error:', e.message);
           }
         }
       } catch (err) {
