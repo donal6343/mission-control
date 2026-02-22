@@ -15,7 +15,7 @@ import {
   Target, Coins, Camera, ChevronLeft, Calendar, Power, Shield, ShieldOff, RefreshCw, Settings,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
-import { useState, useMemo, useCallback } from "react";
+import { useState, useMemo, useCallback, useEffect } from "react";
 
 type TabType = "trueshot" | "crypto";
 
@@ -148,6 +148,13 @@ export default function HomePage() {
     usdc: number;
     matic: number;
   }>("/api/wallet-balance", { refreshInterval: 30000 }); // refresh every 30s
+
+  // Sync trade filter to current bot mode on initial load
+  useEffect(() => {
+    const mode = botData?.bot?.logic?.currentMode;
+    if (mode === 'real') setTradeFilter('real');
+    else if (mode === 'paper') setTradeFilter('paper');
+  }, [botData?.bot?.logic?.currentMode]);
 
   // Compute filtered stats based on trade mode filter (all/paper/real)
   const filteredStats = useMemo(() => {
