@@ -126,6 +126,34 @@ export async function POST(request: Request) {
         return NextResponse.json({ ok: true, action: "set-mode", mode });
       }
 
+      case "set-params": {
+        const { params: newParams } = body;
+        if (!newParams || typeof newParams !== "object") {
+          return NextResponse.json({ error: "params object required" }, { status: 400 });
+        }
+        // Whitelist of allowed param keys
+        const allowed = [
+          "path1Confidence", "path2Confidence", "path3Confidence", "srMinConfidence",
+          "path1Categories", "path2Categories", "path3Categories",
+          "minEdge", "minMarketOdds", "maxConfidence", "maxStakePerTrade",
+          "maxDailyTrades", "maxDailyLoss", "maxConcurrentPositions",
+        ];
+        const configPath = path.join(BOT_DIR, "trading-config.json");
+        const tradingConfig = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+        if (!tradingConfig.params) tradingConfig.params = {};
+        const updated: Record<string, any> = {};
+        for (const [key, value] of Object.entries(newParams)) {
+          if (!allowed.includes(key)) continue;
+          const num = Number(value);
+          if (isNaN(num)) continue;
+          tradingConfig.params[key] = num;
+          updated[key] = num;
+        }
+        tradingConfig.params._lastDashboardUpdate = new Date().toISOString();
+        fs.writeFileSync(configPath, JSON.stringify(tradingConfig, null, 2));
+        return NextResponse.json({ ok: true, action: "set-params", updated });
+      }
+
       default:
         return NextResponse.json({ error: "Unknown action" }, { status: 400 });
     }

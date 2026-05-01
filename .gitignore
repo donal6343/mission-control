@@ -6,3 +6,4 @@ out/
 .next
 .env*
 page.tsx.bak
+tsconfig.tsbuildinfo

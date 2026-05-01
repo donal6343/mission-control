@@ -1,11 +1,12 @@
 import {
   Home, Settings, Bot, MessageSquare, FileText,
-  Radio, BookOpen, Code2,
+  Radio, BookOpen, Code2, Shield,
 } from "lucide-react";
 
 export const NAV_ITEMS = [
   { label: "Home", href: "/", icon: Home },
   { label: "Ops", href: "/ops", icon: Settings },
+  { label: "Audit", href: "/audit", icon: Shield },
   { label: "Agents", href: "/agents", icon: Bot },
   { label: "Chat", href: "/chat", icon: MessageSquare },
   { label: "Content", href: "/content", icon: FileText },

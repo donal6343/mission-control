@@ -12,18 +12,21 @@ import {
   Activity, AlertTriangle, CheckCircle2, TrendingUp,
   Cpu, MemoryStick, LineChart, MessageSquare, ArrowUpRight, ArrowDownRight,
   Zap, Play, Twitter, ExternalLink, Reply, Image as ImageIcon, ChevronDown, ChevronRight,
-  Target, Coins, Camera, ChevronLeft, Calendar, Power, Shield, ShieldOff, RefreshCw, Settings,
+  Target, Coins, Camera, ChevronLeft, Calendar, Power, Shield, ShieldOff, ShieldAlert, RefreshCw, Settings,
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
-import { useState, useMemo, useCallback, useEffect } from "react";
+import { useState, useMemo, useCallback, useEffect, useRef } from "react";
 
-type TabType = "trueshot" | "crypto";
+type TabType = "trueshot" | "crypto" | "audit";
 
 export default function HomePage() {
   const [activeTab, setActiveTab] = useState<TabType>("crypto");
   const [expandedCron, setExpandedCron] = useState<string | null>(null);
   const [selectedDate, setSelectedDate] = useState(() => new Date().toISOString().split("T")[0]);
   const [tradeFilter, setTradeFilter] = useState<'all' | 'paper' | 'real'>('all');
+  const [pathFilter, setPathFilter] = useState<Set<string>>(new Set());
+  const [assetFilter, setAssetFilter] = useState<Set<string>>(new Set());
+  const [confFilter, setConfFilter] = useState<string>('all');
   const [resolving, setResolving] = useState(false);
   const [resolveMsg, setResolveMsg] = useState<string | null>(null);
   
@@ -98,12 +101,30 @@ export default function HomePage() {
         safetyRails?: Array<{ rule: string; value: string }>;
         assetConfig?: Array<{ asset: string; weight: number; sentiment: string; excluded: boolean }>;
         stakeTiers?: Array<{ minConf: number; label: string; stake: number }>;
-        params?: Record<string, number>;
+        params?: Record<string, any>;
         killSwitch?: boolean;
         excludedAssets?: string[];
+        macroUpdate?: { timestamp: string; source: string } | null;
         currentMode?: string;
         fairOddsFormula?: string;
       };
+      circuitBreaker?: {
+        active: boolean;
+        enabled: boolean;
+        bypassed: boolean;
+        bypassReason: string | null;
+        recentResults: string[];
+        recentWR: number | null;
+        pausedUntil: number | null;
+        minsLeft: number;
+        lookback: number;
+        threshold: number;
+      };
+      macroSentiment?: {
+        current: Record<string, { weight: number; outlook: string; confidence: number; summary: string; key_factor: string }>;
+        updatedAt: string | null;
+        recentHistory?: Array<{ timestamp: string; weights: Record<string, number> }>;
+      } | null;
     };
   }>("/api/bot-status", { refreshInterval: REFRESH_INTERVAL });
 
@@ -156,19 +177,42 @@ export default function HomePage() {
     else if (mode === 'paper') setTradeFilter('paper');
   }, [tradingControl?.mode]);
 
-  // Compute filtered stats based on trade mode filter (all/paper/real)
+  // Compute filtered stats based on trade mode + path filters
   const filteredStats = useMemo(() => {
     if (!tradesData?.trades) return null;
-    const filtered = tradeFilter === 'all' ? tradesData.trades : tradesData.trades.filter((t: any) => t.mode === tradeFilter);
+    let filtered = tradeFilter === 'all' ? tradesData.trades : tradesData.trades.filter((t: any) => t.mode === tradeFilter);
+    if (pathFilter.size > 0) {
+      filtered = filtered.filter((t: any) => pathFilter.has(t.tradePath));
+    }
+    if (assetFilter.size > 0) {
+      filtered = filtered.filter((t: any) => assetFilter.has(t.asset));
+    }
+    if (confFilter !== 'all') {
+      const conf = (t: any) => (t.confidence || 0) * 100;
+      if (confFilter === '75+') filtered = filtered.filter((t: any) => conf(t) >= 75);
+      else if (confFilter === '65-74') filtered = filtered.filter((t: any) => conf(t) >= 65 && conf(t) < 75);
+      else if (confFilter === '55-64') filtered = filtered.filter((t: any) => conf(t) >= 55 && conf(t) < 65);
+      else if (confFilter === '<55') filtered = filtered.filter((t: any) => conf(t) < 55);
+    }
     let wins = 0, losses = 0, pending = 0, pnl = 0;
     filtered.forEach((t: any) => {
       if (t.result === 'Win') { wins++; pnl += t.profit; }
       else if (t.result === 'Loss') { losses++; pnl += t.profit; }
-      else { pending++; }
+      else if (t.result === 'Pending') { pending++; }
     });
     const winRate = wins + losses > 0 ? (wins / (wins + losses) * 100).toFixed(1) : 'N/A';
     return { wins, losses, pending, pnl: pnl.toFixed(2), winRate };
-  }, [tradesData, tradeFilter]);
+  }, [tradesData, tradeFilter, pathFilter, assetFilter, confFilter]);
+
+  // Get available paths from today's trades + always-show paths
+  const availablePaths = useMemo(() => {
+    if (!tradesData?.trades) return [];
+    const paths = new Set<string>();
+    tradesData.trades.forEach((t: any) => { if (t.tradePath && t.tradePath !== 'unknown') paths.add(t.tradePath); });
+    // Always show these paths even if no trades yet
+    ['close'].forEach(p => paths.add(p));
+    return Array.from(paths).sort();
+  }, [tradesData]);
 
   // Compute filtered all-time stats from API per-mode breakdowns
   const filteredAllTime = useMemo(() => {
@@ -178,14 +222,38 @@ export default function HomePage() {
     return tradesData?.allTime || null;
   }, [tradesData, tradeFilter]);
 
+  const [killArmed, setKillArmed] = useState(false);
+  const killTimerRef = useRef<NodeJS.Timeout | null>(null);
+  
   const toggleKillSwitch = useCallback(async () => {
-    const action = tradingControl?.killSwitch ? "unkill" : "kill";
+    // If already killed, single press to resume
+    if (tradingControl?.killSwitch) {
+      await fetch("/api/trading-control", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "unkill" }),
+      });
+      return;
+    }
+    
+    // Two-press to kill: first press arms, second press fires
+    if (!killArmed) {
+      setKillArmed(true);
+      // Auto-disarm after 3 seconds
+      if (killTimerRef.current) clearTimeout(killTimerRef.current);
+      killTimerRef.current = setTimeout(() => setKillArmed(false), 3000);
+      return;
+    }
+    
+    // Armed and pressed again — execute kill
+    setKillArmed(false);
+    if (killTimerRef.current) clearTimeout(killTimerRef.current);
     await fetch("/api/trading-control", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action }),
+      body: JSON.stringify({ action: "kill" }),
     });
-  }, [tradingControl?.killSwitch]);
+  }, [tradingControl?.killSwitch, killArmed]);
 
   const setTradingMode = useCallback(async (mode: string) => {
     await fetch("/api/trading-control", {
@@ -259,6 +327,17 @@ export default function HomePage() {
         >
           <Coins className="w-4 h-4" />
           Crypto Bot
+        </button>
+        <button
+          onClick={() => setActiveTab("audit")}
+          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+            activeTab === "audit"
+              ? "bg-purple-500/20 text-purple-400 border border-purple-500/30"
+              : "bg-white/[0.03] text-zinc-400 border border-white/[0.05] hover:bg-white/[0.05]"
+          }`}
+        >
+          <Shield className="w-4 h-4" />
+          Bot Auditor
         </button>
       </div>
 
@@ -668,7 +747,7 @@ export default function HomePage() {
         </GlassCard>
       </div>
         </>
-      ) : (
+      ) : activeTab === "crypto" ? (
         /* Crypto Tab Content */
         <>
       {/* Polymarket Section TOP */}
@@ -807,11 +886,15 @@ export default function HomePage() {
               className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
                 tradingControl?.killSwitch
                   ? "bg-accent-red/20 text-accent-red border border-accent-red/30 animate-pulse"
-                  : "bg-white/[0.03] text-zinc-400 border border-white/[0.05] hover:bg-accent-red/10 hover:text-accent-red hover:border-accent-red/20"
+                  : killArmed
+                    ? "bg-accent-red/30 text-accent-red border border-accent-red/50 animate-pulse"
+                    : "bg-white/[0.03] text-zinc-400 border border-white/[0.05] hover:bg-accent-red/10 hover:text-accent-red hover:border-accent-red/20"
               }`}
             >
               {tradingControl?.killSwitch ? (
                 <><ShieldOff className="w-3.5 h-3.5" /> KILLED — Click to Resume</>
+              ) : killArmed ? (
+                <><ShieldAlert className="w-3.5 h-3.5" /> CONFIRM KILL</>
               ) : (
                 <><Shield className="w-3.5 h-3.5" /> Kill Switch</>
               )}
@@ -923,17 +1006,120 @@ export default function HomePage() {
             ))}
           </div>
 
+          {/* Path Filter - multi-select */}
+          {availablePaths.length > 0 && (
+            <div className="flex flex-wrap gap-1 mb-2">
+              <button
+                onClick={() => setPathFilter(new Set())}
+                className={`text-[10px] px-2 py-0.5 rounded transition-colors ${
+                  pathFilter.size === 0 ? 'bg-white/10 text-zinc-200' : 'text-zinc-500 hover:text-zinc-300'
+                }`}
+              >
+                All Paths
+              </button>
+              {availablePaths.map(p => {
+                const labels: Record<string, string> = {
+                  path1: 'Path 1', path2: 'Path 2', path3: 'Path 3',
+                  sr: '🏗️ S/R', arb: '🎰 Arb', breakingNews: '⚡ News',
+                  macro: '📅 Macro', whale: '🐋 Whale', trend: '📈 Trend', copy: '🔄 Copy', adaptive: '🧠 Adaptive', close: '🔒 Close', unknown: '❓',
+                };
+                const isSelected = pathFilter.has(p);
+                return (
+                  <button
+                    key={p}
+                    onClick={() => {
+                      const next = new Set(pathFilter);
+                      if (isSelected) next.delete(p); else next.add(p);
+                      setPathFilter(next);
+                    }}
+                    className={`text-[10px] px-2 py-0.5 rounded transition-colors ${
+                      isSelected ? 'bg-accent-blue/20 text-accent-blue border border-accent-blue/30' : 'text-zinc-500 hover:text-zinc-300 border border-transparent'
+                    }`}
+                  >
+                    {labels[p] || p}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Asset Filter */}
+          <div className="flex flex-wrap gap-1 mb-2">
+            <button
+              onClick={() => setAssetFilter(new Set())}
+              className={`text-[10px] px-2 py-0.5 rounded transition-colors ${
+                assetFilter.size === 0 ? 'bg-white/10 text-zinc-200' : 'text-zinc-500 hover:text-zinc-300'
+              }`}
+            >
+              All Assets
+            </button>
+            {['BTC', 'ETH', 'SOL', 'XRP'].map(asset => {
+              const isSelected = assetFilter.has(asset);
+              return (
+                <button
+                  key={asset}
+                  onClick={() => {
+                    const next = new Set(assetFilter);
+                    if (isSelected) next.delete(asset); else next.add(asset);
+                    setAssetFilter(next);
+                  }}
+                  className={`text-[10px] px-2 py-0.5 rounded transition-colors ${
+                    isSelected ? 'bg-accent-amber/20 text-accent-amber border border-accent-amber/30' : 'text-zinc-500 hover:text-zinc-300 border border-transparent'
+                  }`}
+                >
+                  {asset}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Confidence Filter */}
+          <div className="flex flex-wrap gap-1 mb-2">
+            {[
+              { key: 'all', label: 'All Conf' },
+              { key: '75+', label: '75%+' },
+              { key: '65-74', label: '65-74%' },
+              { key: '55-64', label: '55-64%' },
+              { key: '<55', label: '<55%' },
+            ].map(({ key, label }) => (
+              <button
+                key={key}
+                onClick={() => setConfFilter(key)}
+                className={`text-[10px] px-2 py-0.5 rounded transition-colors ${
+                  confFilter === key ? 'bg-purple-500/20 text-purple-400 border border-purple-500/30' : 'text-zinc-500 hover:text-zinc-300 border border-transparent'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
           {/* Trades List */}
+          {(() => {
+            const matchTrade = (t: any) => {
+              if (tradeFilter !== 'all' && t.mode !== tradeFilter) return false;
+              if (pathFilter.size > 0 && !pathFilter.has(t.tradePath)) return false;
+              if (assetFilter.size > 0 && !assetFilter.has(t.asset)) return false;
+              if (confFilter !== 'all') {
+                const c = (t.confidence || 0) * 100;
+                if (confFilter === '75+' && c < 75) return false;
+                if (confFilter === '65-74' && (c < 65 || c >= 75)) return false;
+                if (confFilter === '55-64' && (c < 55 || c >= 65)) return false;
+                if (confFilter === '<55' && c >= 55) return false;
+              }
+              return true;
+            };
+            return (
           <div className="space-y-2 max-h-[400px] overflow-y-auto custom-scrollbar">
             {tradesLoading ? (
               <div className="text-center py-8">
                 <div className="inline-block w-5 h-5 border-2 border-accent-yellow/30 border-t-accent-yellow rounded-full animate-spin" />
               </div>
-            ) : tradesData?.trades && tradesData.trades.filter((t: any) => tradeFilter === 'all' || t.mode === tradeFilter).length > 0 ? (
-              tradesData.trades.filter((t: any) => tradeFilter === 'all' || t.mode === tradeFilter).map((trade: any) => (
+            ) : tradesData?.trades && tradesData.trades.filter(matchTrade).length > 0 ? (
+              tradesData.trades.filter(matchTrade).map((trade: any) => (
                 <a 
                   key={trade.id} 
-                  href={trade.notionUrl}
+                  href={trade.marketUrl || trade.notionUrl}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="flex items-center gap-3 py-2.5 px-2.5 sm:px-3 hover:bg-white/[0.03] rounded-lg cursor-pointer transition-colors border border-white/[0.03] bg-white/[0.01]"
@@ -956,11 +1142,14 @@ export default function HomePage() {
                       <span className={`text-[10px] sm:text-xs px-1 sm:px-1.5 py-0.5 rounded ${
                         trade.direction === "Up" ? "bg-accent-green/10 text-accent-green" : "bg-accent-red/10 text-accent-red"
                       }`}>{trade.direction}</span>
-                      <span className="text-[10px] sm:text-xs text-zinc-500">{(trade.confidence * 100).toFixed(0)}%</span>
-                      {trade.odds && <span className="text-[10px] text-zinc-600 hidden sm:inline">@ {(trade.odds * 100).toFixed(0)}%</span>}
+                      {(trade as any).fillPrice
+                        ? <><span className="text-[10px] sm:text-xs text-zinc-400 font-medium">@ {((trade as any).fillPrice * 100).toFixed(1)}%</span>{(trade as any).fillPrice !== trade.odds && <span className="text-[10px] text-zinc-600 hidden sm:inline ml-1">(sig {(trade.odds * 100).toFixed(0)}%)</span>}</>
+                        : <span className="text-[10px] sm:text-xs text-zinc-500">@ {(trade.odds * 100).toFixed(1)}%</span>
+                      }
+                      {trade.stake && <span className="text-[10px] sm:text-xs text-accent-yellow font-medium">${trade.stake}</span>}
                     </div>
                     <div className="text-[9px] sm:text-[10px] text-zinc-500 mt-0.5 truncate">
-                      {trade.windowEnd ? new Date(trade.windowEnd).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '-'}
+                      {trade.windowEnd ? `closes ${new Date(trade.windowEnd).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : trade.executionTime ? new Date(trade.executionTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '-'}
                       {trade.signals && <span className="ml-1.5 truncate">📊 {trade.signals.substring(0, 40)}{trade.signals.length > 40 ? '...' : ''}</span>}
                     </div>
                   </div>
@@ -968,7 +1157,11 @@ export default function HomePage() {
                   {/* Result */}
                   <div className="flex flex-col items-end gap-0.5 shrink-0">
                     <div className="flex items-center gap-1">
+                      {trade.notionUrl && <a href={trade.notionUrl} target="_blank" rel="noopener noreferrer" onClick={(e) => e.stopPropagation()} className="text-[10px] text-zinc-600 hover:text-zinc-300 transition-colors" title="Open in Notion">📋</a>}
                       {trade.mode === 'real' && <span className="text-[8px] px-1 rounded bg-accent-green/20 text-accent-green">REAL</span>}
+                      {trade.tradePath && trade.tradePath !== 'unknown' && <span className="text-[8px] px-1 rounded bg-accent-blue/15 text-accent-blue/70" title={`Path: ${trade.tradePath}`}>{
+                        ({ path1: 'P1', path2: 'P2', path3: 'P3', sr: 'S/R', arb: 'ARB', breakingNews: 'NEWS', macro: 'MACRO', whale: 'WHALE', trend: 'TREND', copy: 'COPY', adaptive: '🧠', close: '🔒' } as Record<string, string>)[trade.tradePath] || trade.tradePath
+                      }</span>}
                       <span className={`text-[10px] sm:text-xs px-2 py-0.5 sm:py-1 rounded-lg font-medium ${
                         trade.result === "Win" ? "bg-accent-green/20 text-accent-green" :
                         trade.result === "Loss" ? "bg-accent-red/20 text-accent-red" :
@@ -1001,6 +1194,8 @@ export default function HomePage() {
               </div>
             )}
           </div>
+            );
+          })()}
         </GlassCard>
 
           {/* Trading Control Panel */}
@@ -1015,7 +1210,8 @@ export default function HomePage() {
                   body: JSON.stringify(body),
                 });
                 console.log('[postConfig] status:', res.status);
-                refreshBotStatus();
+                // Small delay to let file write complete, then refresh
+                setTimeout(() => refreshBotStatus(), 200);
               } catch (err) {
                 console.error('[postConfig] error:', err);
               }
@@ -1037,6 +1233,52 @@ export default function HomePage() {
                   {logic.killSwitch ? '🛑 PAUSED' : 'Trading Active'}
                 </button>
               </div>
+
+              {/* Circuit Breaker Status */}
+              {(() => {
+                const cb = botData?.bot?.circuitBreaker;
+                if (!cb) return null;
+                return (
+                  <div className={`flex items-center gap-3 px-3 py-2 rounded-lg border mb-3 ${
+                    cb.active ? 'bg-accent-red/10 border-accent-red/30' :
+                    cb.bypassed ? 'bg-zinc-700/30 border-zinc-600/30' :
+                    'bg-accent-green/10 border-accent-green/30'
+                  }`}>
+                    <div className="flex items-center gap-2 flex-1">
+                      <span className="text-sm">{cb.active ? '🚨' : cb.bypassed ? '⏸️' : '✅'}</span>
+                      <div>
+                        <span className={`text-xs font-medium ${
+                          cb.active ? 'text-accent-red' : cb.bypassed ? 'text-zinc-400' : 'text-accent-green'
+                        }`}>
+                          Circuit Breaker: {cb.active ? `ACTIVE (${cb.minsLeft}m left)` : cb.bypassed ? `Off (${cb.bypassReason})` : 'Ready'}
+                        </span>
+                        {cb.recentWR !== null && (
+                          <span className={`text-[10px] ml-2 ${cb.recentWR < cb.threshold ? 'text-accent-red' : 'text-zinc-400'}`}>
+                            Recent WR: {cb.recentWR}% ({cb.recentResults.length} trades) · Threshold: {cb.threshold}%
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => postConfig({ action: 'toggleCircuitBreaker', enabled: !cb.enabled })}
+                      className={`px-2.5 py-1 rounded text-[10px] font-medium transition-colors ${
+                        cb.enabled
+                          ? 'bg-accent-green/20 text-accent-green border border-accent-green/30 hover:bg-accent-green/30'
+                          : 'bg-zinc-700/50 text-zinc-400 border border-zinc-600/30 hover:bg-zinc-700'
+                      }`}
+                    >
+                      {cb.enabled ? 'Enabled' : 'Disabled'}
+                    </button>
+                    {cb.recentResults.length > 0 && (
+                      <div className="flex gap-0.5">
+                        {cb.recentResults.map((r: string, i: number) => (
+                          <span key={i} className={`w-2 h-2 rounded-full ${r === 'W' ? 'bg-accent-green' : 'bg-accent-red'}`} />
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
 
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
                 {/* Column 1: Decision Paths */}
@@ -1066,26 +1308,172 @@ export default function HomePage() {
                     ))}
                   </div>
 
-                  {/* Asset Toggles */}
+                  {/* Macro Direction Lean — at-a-glance view */}
+                  {botData?.bot?.macroSentiment?.current && (
+                    <div className="mt-3">
+                      <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">Direction Lean</h3>
+                      <div className="grid grid-cols-3 gap-2">
+                        {['BTC', 'ETH', 'SOL'].map(asset => {
+                          const d = botData?.bot?.macroSentiment?.current?.[asset];
+                          if (!d) return null;
+                          const w = d.weight || 0;
+                          const outlook = d.outlook || 'neutral';
+                          const conf = d.confidence || 0;
+                          const bgClass = outlook === 'bullish' ? 'border-accent-green/30 bg-accent-green/10' : outlook === 'bearish' ? 'border-accent-red/30 bg-accent-red/10' : 'border-zinc-700 bg-zinc-800/50';
+                          const textClass = outlook === 'bullish' ? 'text-accent-green' : outlook === 'bearish' ? 'text-accent-red' : 'text-zinc-400';
+                          const icon = outlook === 'bullish' ? '↑' : outlook === 'bearish' ? '↓' : '→';
+                          const barWidth = Math.min(Math.abs(w) / 0.05 * 100, 100);
+                          const barColor = outlook === 'bullish' ? 'bg-accent-green' : outlook === 'bearish' ? 'bg-accent-red' : 'bg-zinc-600';
+                          return (
+                            <div key={asset} className={`rounded-lg border px-3 py-2 ${bgClass}`}>
+                              <div className="flex items-center justify-between">
+                                <span className="text-sm font-bold text-zinc-200">{asset}</span>
+                                <span className={`text-lg font-bold ${textClass}`}>{icon}</span>
+                              </div>
+                              <div className={`text-xs font-semibold ${textClass} mt-0.5`}>
+                                {w > 0 ? '+' : ''}{(w * 100).toFixed(1)}% {outlook}
+                              </div>
+                              {/* Strength bar */}
+                              <div className="mt-1.5 h-1 bg-zinc-800 rounded-full overflow-hidden">
+                                <div className={`h-full rounded-full ${barColor} transition-all`} style={{ width: `${barWidth}%` }} />
+                              </div>
+                              <div className="text-[10px] text-zinc-500 mt-1">
+                                {(conf * 100).toFixed(0)}% confident
+                              </div>
+                              {d.key_factor && (
+                                <div className="text-[10px] text-zinc-400 mt-0.5 leading-snug truncate" title={d.key_factor}>
+                                  ⚡ {d.key_factor}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                      {botData?.bot?.macroSentiment?.updatedAt && (
+                        <div className="text-[10px] text-zinc-600 mt-1.5">
+                          Updated: {new Date(botData?.bot?.macroSentiment?.updatedAt).toLocaleTimeString()} · Refreshes hourly
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Asset Config */}
                   {logic.assetConfig && (
                     <div className="mt-3">
-                      <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">Assets</h3>
-                      <div className="flex gap-2 flex-wrap">
+                      <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">Assets & Macro Bias</h3>
+                      <div className="space-y-2">
                         {logic.assetConfig.map((a: any) => (
-                          <button
-                            key={a.asset}
-                            onClick={() => postConfig({ action: 'toggleAsset', asset: a.asset, excluded: !a.excluded })}
-                            className={`text-xs px-2 py-1 rounded-lg border transition-colors ${
-                              a.excluded ? "border-red-500/30 bg-red-500/10 text-red-400" :
-                              a.sentiment === "bullish" ? "border-accent-green/30 bg-accent-green/10 text-accent-green" :
-                              a.sentiment === "bearish" ? "border-accent-red/30 bg-accent-red/10 text-accent-red" :
-                              "border-zinc-600/30 bg-zinc-600/10 text-zinc-400"
-                            }`}
-                          >
-                            <span className="font-medium">{a.asset}</span>
-                            {a.excluded ? " ✗" : ` ${a.weight > 0 ? "+" : ""}${(a.weight * 100).toFixed(0)}%`}
-                          </button>
+                          <div key={a.asset} className={`text-xs px-2.5 py-2 rounded-lg border ${
+                            a.excluded ? "border-red-500/30 bg-red-500/10" :
+                            a.sentiment === "bullish" ? "border-accent-green/20 bg-accent-green/5" :
+                            a.sentiment === "bearish" ? "border-accent-red/20 bg-accent-red/5" :
+                            "border-zinc-700 bg-zinc-800/50"
+                          }`}>
+                            <div className="flex items-center justify-between mb-1">
+                              <div className="flex items-center gap-2">
+                                <button
+                                  onClick={() => postConfig({ action: 'toggleAsset', asset: a.asset, excluded: !a.excluded })}
+                                  className={`font-medium ${a.excluded ? 'text-red-400 line-through' : 'text-zinc-200'}`}
+                                >
+                                  {a.asset} {a.excluded ? '✗' : ''}
+                                </button>
+                                <span className={`${a.sentiment === 'bullish' ? 'text-accent-green' : a.sentiment === 'bearish' ? 'text-accent-red' : 'text-zinc-500'}`}>
+                                  {a.sentiment === 'bullish' ? '📈' : a.sentiment === 'bearish' ? '📉' : '➡️'} {a.sentiment}
+                                </span>
+                              </div>
+                              {!a.excluded && (
+                                <div className="flex items-center gap-1">
+                                  {(logic.params?.macroWeightSource || 'manual') === 'manual' ? (
+                                    <>
+                                      <button
+                                        onClick={() => postConfig({ action: 'updateAssetWeight', asset: a.asset, weight: Math.max(-0.05, Math.round((a.weight - 0.01) * 100) / 100) })}
+                                        className="w-5 h-5 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-300 flex items-center justify-center"
+                                      >-</button>
+                                      <span className={`font-mono w-10 text-center ${a.weight > 0 ? 'text-accent-green' : a.weight < 0 ? 'text-accent-red' : 'text-zinc-400'}`}>
+                                        {a.weight > 0 ? '+' : ''}{(a.weight * 100).toFixed(0)}%
+                                      </span>
+                                      <button
+                                        onClick={() => postConfig({ action: 'updateAssetWeight', asset: a.asset, weight: Math.min(0.05, Math.round((a.weight + 0.01) * 100) / 100) })}
+                                        className="w-5 h-5 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-300 flex items-center justify-center"
+                                      >+</button>
+                                      <button
+                                        onClick={() => postConfig({ action: 'updateAssetWeight', asset: a.asset, weight: 0 })}
+                                        className="w-5 h-5 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-400 flex items-center justify-center text-[9px]"
+                                      >⊘</button>
+                                    </>
+                                  ) : (
+                                    <span className={`font-mono text-xs ${a.weight > 0 ? 'text-accent-green' : a.weight < 0 ? 'text-accent-red' : 'text-zinc-400'}`}>
+                                      {a.weight > 0 ? '+' : ''}{(a.weight * 100).toFixed(1)}% <span className="text-zinc-500 text-[10px]">(engine)</span>
+                                    </span>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                            {!a.excluded && (
+                              <div className="flex items-center justify-between mt-1">
+                                <span className="text-[10px] text-zinc-500">Stake multiplier</span>
+                                <div className="flex items-center gap-1">
+                                  <button
+                                    onClick={() => postConfig({ action: 'updateAssetStake', asset: a.asset, multiplier: Math.max(0, Math.round(((a.stakeMultiplier ?? 1.0) - 0.1) * 10) / 10) })}
+                                    className="w-4 h-4 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-300 flex items-center justify-center text-[10px]"
+                                  >-</button>
+                                  <span className={`font-mono text-[10px] w-8 text-center ${(a.stakeMultiplier ?? 1.0) === 1.0 ? 'text-zinc-400' : (a.stakeMultiplier ?? 1.0) > 1.0 ? 'text-accent-green' : 'text-accent-red'}`}>
+                                    {(a.stakeMultiplier ?? 1.0).toFixed(1)}x
+                                  </span>
+                                  <button
+                                    onClick={() => postConfig({ action: 'updateAssetStake', asset: a.asset, multiplier: Math.min(3.0, Math.round(((a.stakeMultiplier ?? 1.0) + 0.1) * 10) / 10) })}
+                                    className="w-4 h-4 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-300 flex items-center justify-center text-[10px]"
+                                  >+</button>
+                                </div>
+                              </div>
+                            )}
+                            {a.macro && !a.excluded && (logic.params?.macroWeightSource || 'manual') === 'engine' && (
+                              <div className="mt-1.5 p-1.5 rounded bg-zinc-800/80 border border-zinc-700/50">
+                                <div className="text-[11px] text-zinc-300 leading-snug">
+                                  {a.macro.sentimentRaw || a.macro.priceTrend || 'No analysis available'}
+                                </div>
+                                {a.macro.keyFactor && (
+                                  <div className="text-[10px] text-accent-yellow mt-1">
+                                    ⚡ {a.macro.keyFactor}
+                                  </div>
+                                )}
+                                {a.macro.confidence !== undefined && (
+                                  <div className="text-[10px] text-zinc-500 mt-0.5">
+                                    Confidence: {((a.macro.confidence || 0) * 100).toFixed(0)}% · {a.macro.source || 'unknown'}
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                            {a.macro && !a.excluded && (logic.params?.macroWeightSource || 'manual') === 'manual' && (
+                              <div className="text-[10px] text-zinc-500 mt-1 leading-tight">
+                                {a.macro.sentimentRaw || a.macro.priceTrend || 'Price-trend fallback (Grok disabled)'}
+                                {a.macro.momentum4h !== undefined && <span className="ml-1 text-zinc-600">| 4h: {(a.macro.momentum4h * 100).toFixed(1)}%</span>}
+                              </div>
+                            )}
+                            {!a.macro && !a.excluded && (
+                              <div className="text-[10px] text-zinc-500 mt-1">Source: price-trend fallback (Grok disabled)</div>
+                            )}
+                          </div>
                         ))}
+                      </div>
+                      <div className="flex items-center gap-3 mt-3">
+                        <span className="text-xs text-zinc-400 font-medium">Weight source:</span>
+                        {['manual', 'engine'].map(src => (
+                          <button
+                            key={src}
+                            onClick={(e) => { e.preventDefault(); e.stopPropagation(); console.log('[macro] switching to', src); postConfig({ action: 'updateParam', key: 'macroWeightSource', value: src }); }}
+                            className={`px-4 py-1.5 rounded text-xs font-semibold transition-colors cursor-pointer ${
+                              (logic.params?.macroWeightSource || 'manual') === src
+                                ? 'bg-accent-yellow text-black ring-2 ring-yellow-500/50'
+                                : 'bg-zinc-700 text-zinc-300 hover:bg-zinc-600 hover:text-white'
+                            }`}
+                          >{src.charAt(0).toUpperCase() + src.slice(1)}</button>
+                        ))}
+                      </div>
+                      <div className="text-[10px] text-zinc-600 mt-1">
+                        Manual = you set weights with sliders. Engine = macro bot sets weights automatically.
+                        {logic.macroUpdate?.timestamp && <span> Last: {new Date(logic.macroUpdate.timestamp).toLocaleTimeString()}</span>}
+                        {logic.macroUpdate?.source && <span> ({logic.macroUpdate.source})</span>}
                       </div>
                     </div>
                   )}
@@ -1098,13 +1486,32 @@ export default function HomePage() {
                     {[
                       { key: 'minEdge', label: 'Min Edge', scale: 100, min: 1, max: 20 },
                       { key: 'minMarketOdds', label: 'Min Market Odds', scale: 100, min: 20, max: 60 },
-                      { key: 'arbMinDiscrepancy', label: 'ARB Min Discrepancy', scale: 100, min: 1, max: 10 },
-                      { key: 'arbMinConfidence', label: 'ARB Min Confidence', scale: 100, min: 30, max: 70 },
-                      { key: 'breakingNewsMinConfidence', label: 'News Min Conf', scale: 100, min: 40, max: 80 },
+                      { key: 'maxConfidence', label: 'Max Confidence', scale: 100, min: 50, max: 95 },
+                      { key: 'underdogThreshold', label: 'Underdog Threshold', scale: 100, min: 20, max: 50 },
                       { key: 'path1Confidence', label: 'Path1 Min Conf', scale: 100, min: 40, max: 80 },
+                      { key: 'path1Categories', label: 'Path1 Min Cats', scale: 1, min: 1, max: 5, unit: '' },
                       { key: 'path2Confidence', label: 'Path2 Min Conf', scale: 100, min: 40, max: 80 },
+                      { key: 'path2Categories', label: 'Path2 Min Cats', scale: 1, min: 1, max: 5, unit: '' },
                       { key: 'path3Confidence', label: 'Path3 Min Conf', scale: 100, min: 50, max: 90 },
-                    ].map(({ key, label, scale, min, max }) => {
+                      { key: 'path3Categories', label: 'Path3 Min Cats', scale: 1, min: 1, max: 5, unit: '' },
+                      { key: 'srMinConfidence', label: 'S/R Min Conf', scale: 100, min: 30, max: 70 },
+                      { key: 'arbMinDiscrepancy', label: 'ARB Min Disc', scale: 100, min: 1, max: 10 },
+                      { key: 'arbMinConfidence', label: 'ARB Min Conf', scale: 100, min: 30, max: 70 },
+                      { key: 'arbMinPriceMove', label: 'ARB Min Price Move', scale: 1000, min: 1, max: 20, unit: '‰' },
+                      { key: 'breakingNewsMinConfidence', label: 'News Min Conf', scale: 100, min: 40, max: 80 },
+                      { key: 'breakingNewsMaxOdds', label: 'News Max Odds', scale: 100, min: 50, max: 90 },
+                      { key: 'breakingNewsMaxPerHour', label: 'News Max/Hour', scale: 1, min: 1, max: 10, unit: '' },
+                      { key: 'breakingNewsCooldownMin', label: 'News Cooldown', scale: 1, min: 5, max: 60, unit: 'min' },
+                      { key: 'breakingNewsMinPriceMove', label: 'News Min Price Move', scale: 1000, min: 1, max: 20, unit: '‰' },
+                      { key: 'correlationThreshold', label: 'Corr Threshold', scale: 100, min: 1, max: 10 },
+                      { key: 'correlationWindow', label: 'Corr Window', scale: 1, min: 1, max: 15, unit: 'min' },
+                      { key: 'maxDailyTrades', label: 'Max Daily Trades', scale: 1, min: 5, max: 1000, unit: '' },
+                      { key: 'maxConcurrentPositions', label: 'Max Concurrent', scale: 1, min: 5, max: 200, unit: '' },
+                      { key: 'maxStakePerTrade', label: 'Max Stake/Trade', scale: 1, min: 5, max: 500, unit: '$' },
+                      { key: 'maxDailyLoss', label: 'Max Daily Loss', scale: 1, min: 10, max: 500, unit: '$' },
+                      { key: 'macroWeightMultiplier', label: 'Macro Weight ×', scale: 1, min: 0, max: 40, unit: '' },
+                      { key: 'macroSpread', label: 'Macro Spread', scale: 100, min: 0, max: 100, unit: '%' },
+                    ].map(({ key, label, scale, min, max, unit }) => {
                       const val = logic.params?.[key] !== undefined ? Math.round(logic.params[key] * scale) : 0;
                       return (
                         <div key={key} className="flex items-center justify-between text-xs gap-2">
@@ -1117,6 +1524,7 @@ export default function HomePage() {
                             <div className="flex items-center gap-0">
                               <input
                                 type="number"
+                                key={`${key}-${val}`}
                                 defaultValue={val}
                                 min={min}
                                 max={max}
@@ -1129,7 +1537,7 @@ export default function HomePage() {
                                 onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }}
                                 className="w-10 bg-transparent text-zinc-200 font-mono text-center border-b border-zinc-600 focus:border-accent-yellow outline-none py-0.5"
                               />
-                              <span className="text-zinc-500">%</span>
+                              <span className="text-zinc-500">{unit !== undefined ? unit : '%'}</span>
                             </div>
                             <button
                               onClick={() => { const nv = Math.min(max, val + 1); if (nv !== val) postConfig({ action: 'updateParam', key, value: nv / scale }); }}
@@ -1192,6 +1600,11 @@ export default function HomePage() {
                       Fair odds: <span className="font-mono text-zinc-400">{logic.fairOddsFormula}</span>
                     </div>
                   )}
+
+                  {/* Path-specific stake overrides */}
+                  <div className="mt-3 pt-3 border-t border-white/[0.05]">
+                    <PathStakeTiers postConfig={postConfig} defaultTiers={logic.stakeTiers || []} />
+                  </div>
                 </div>
               </div>
             </GlassCard>
@@ -1335,8 +1748,249 @@ export default function HomePage() {
             </GlassCard>
           </div>
         </>
+      ) : (
+        /* Audit Tab Content */
+        <AuditTabContent />
       )}
     </PageWrapper>
+  );
+}
+
+// ─── Audit Tab ─────────────────────────────────────────────────────────────
+
+interface AuditFinding {
+  summary: string;
+  category: string;
+  severity: string;
+  recommendation: string;
+  evidence: string;
+  impact: string;
+}
+
+interface AuditData {
+  timestamp: string | null;
+  healthScore: number | null;
+  totalFindings: number;
+  tradesAnalyzed?: number;
+  overallWinRate?: number;
+  overallPnl?: number;
+  bySeverity: { critical: number; high: number; medium: number; low: number; info: number };
+  byCategory: { performance: number; reliability: number; "new-opportunity": number; risk: number; optimization: number };
+  findings: AuditFinding[];
+}
+
+const SEV_STYLE: Record<string, { color: string; bg: string }> = {
+  critical: { color: "text-red-400", bg: "bg-red-500/10 border-red-500/20" },
+  high: { color: "text-orange-400", bg: "bg-orange-500/10 border-orange-500/20" },
+  medium: { color: "text-yellow-400", bg: "bg-yellow-500/10 border-yellow-500/20" },
+  low: { color: "text-blue-400", bg: "bg-blue-500/10 border-blue-500/20" },
+  info: { color: "text-zinc-400", bg: "bg-zinc-500/10 border-zinc-500/20" },
+};
+
+const CAT_STYLE: Record<string, { label: string; color: string }> = {
+  performance: { label: "Performance", color: "text-blue-400" },
+  reliability: { label: "Reliability", color: "text-red-400" },
+  "new-opportunity": { label: "New Opportunities", color: "text-green-400" },
+  risk: { label: "Risk", color: "text-orange-400" },
+  optimization: { label: "Optimization", color: "text-purple-400" },
+};
+
+function PathStakeTiers({ postConfig, defaultTiers }: { postConfig: (body: any) => void; defaultTiers: any[] }) {
+  const [selectedGroup, setSelectedGroup] = useState<string | null>(null);
+  const { data: config, refresh: refreshConfig } = useApi<any>('/api/trading-config', { refreshInterval: REFRESH_INTERVAL });
+  // Wrap postConfig to also refresh our local config
+  const post = async (body: any) => {
+    await postConfig(body);
+    setTimeout(() => refreshConfig(), 300);
+  };
+  const groups = [
+    { key: 'path1', label: 'Path 1' },
+    { key: 'path2', label: 'Path 2' },
+    { key: 'path3', label: 'Path 3' },
+    { key: 'sr', label: '🏗️ S/R' },
+    { key: 'arb', label: '🎰 Arb' },
+    { key: 'breakingNews', label: '⚡ News' },
+    { key: 'macro', label: '📅 Macro' },
+    { key: 'trend', label: '📈 Trend' },
+    { key: 'copy', label: '🔄 Copy' },
+    { key: 'adaptive', label: '🧠 Adaptive' },
+    { key: 'close', label: '🔒 Close' },
+  ];
+
+  const pathTiers = config?.pathStakeTiers || {};
+  const activeTiers = selectedGroup ? (pathTiers[selectedGroup] || null) : null;
+  const displayTiers = activeTiers || defaultTiers || [];
+  const isCustom = selectedGroup && !!pathTiers[selectedGroup];
+
+  return (
+    <div>
+      <h4 className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider mb-1.5">Per-Path Stakes</h4>
+      <div className="flex flex-wrap gap-1 mb-2">
+        {groups.map(g => (
+          <button
+            key={g.key}
+            onClick={() => setSelectedGroup(selectedGroup === g.key ? null : g.key)}
+            className={`text-[9px] px-1.5 py-0.5 rounded transition-colors ${
+              selectedGroup === g.key
+                ? pathTiers[g.key] ? 'bg-accent-blue/20 text-accent-blue border border-accent-blue/30' : 'bg-white/10 text-zinc-200 border border-zinc-500/30'
+                : pathTiers[g.key] ? 'text-accent-blue/70 border border-transparent' : 'text-zinc-600 border border-transparent hover:text-zinc-400'
+            }`}
+          >
+            {g.label}{pathTiers[g.key] ? ' ✦' : ''}
+          </button>
+        ))}
+      </div>
+      {selectedGroup && (
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-[9px] text-zinc-500">{isCustom ? 'Custom stakes' : 'Using default stakes'}</span>
+            {isCustom && (
+              <button
+                onClick={() => post({ action: 'clearPathStakeTier', group: selectedGroup })}
+                className="text-[9px] text-accent-red/70 hover:text-accent-red"
+              >Reset to default</button>
+            )}
+          </div>
+          {displayTiers.map((tier: any, i: number) => (
+            <div key={i} className="flex items-center justify-between text-[10px] px-2 py-1 rounded bg-zinc-800/50">
+              <span className="text-zinc-400">{tier.label}</span>
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => post({ action: 'updatePathStakeTier', group: selectedGroup, index: i, stake: Math.max(1, (tier.stake || 5) - 5) })}
+                  className="w-4 h-4 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-300 flex items-center justify-center text-[10px]"
+                >-</button>
+                <span className="text-zinc-300 font-mono w-8 text-center">${tier.stake || 5}</span>
+                <button
+                  onClick={() => post({ action: 'updatePathStakeTier', group: selectedGroup, index: i, stake: (tier.stake || 5) + 5 })}
+                  className="w-4 h-4 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-300 flex items-center justify-center text-[10px]"
+                >+</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AuditTabContent() {
+  const { data, loading } = useApi<AuditData>("/api/audit", { refreshInterval: REFRESH_INTERVAL });
+  const [expandedEvidence, setExpandedEvidence] = useState<Record<number, boolean>>({});
+
+  if (loading && !data) return <GridSkeleton />;
+
+  const findings = data?.findings || [];
+  const healthScore = data?.healthScore ?? 0;
+  const scoreColor = healthScore >= 80 ? "text-green-400" : healthScore >= 60 ? "text-yellow-400" : healthScore >= 40 ? "text-orange-400" : "text-red-400";
+  const scoreBg = healthScore >= 80 ? "bg-green-500/10" : healthScore >= 60 ? "bg-yellow-500/10" : healthScore >= 40 ? "bg-orange-500/10" : "bg-red-500/10";
+
+  const categories = ["performance", "optimization", "new-opportunity", "reliability", "risk"];
+
+  return (
+    <>
+      {/* Top Stats */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
+        <GlassCard className="p-4">
+          <div className={`flex items-center gap-3 p-3 rounded-xl ${scoreBg}`}>
+            <div className={`text-3xl font-bold ${scoreColor}`}>{healthScore}</div>
+            <div className="text-xs text-zinc-400">
+              <div className={`font-medium ${scoreColor}`}>
+                {healthScore >= 80 ? "Healthy" : healthScore >= 60 ? "Fair" : healthScore >= 40 ? "Degraded" : "Critical"}
+              </div>
+              <div>Health Score</div>
+            </div>
+          </div>
+        </GlassCard>
+        <GlassCard className="p-4">
+          <div className="text-xs text-zinc-500 mb-1">Trades Analyzed</div>
+          <div className="text-2xl font-bold text-zinc-200">{data?.tradesAnalyzed || 0}</div>
+          <div className="flex gap-2 mt-2 text-xs">
+            {data?.overallWinRate != null && <span className="text-green-400">{(data.overallWinRate * 100).toFixed(1)}% WR</span>}
+            {data?.overallPnl != null && <span className={data.overallPnl >= 0 ? "text-green-400" : "text-red-400"}>{data.overallPnl >= 0 ? "+" : ""}${data.overallPnl.toFixed(2)}</span>}
+          </div>
+        </GlassCard>
+        <GlassCard className="p-4">
+          <div className="text-xs text-zinc-500 mb-1">Findings</div>
+          <div className="text-2xl font-bold text-zinc-200">{data?.totalFindings || 0}</div>
+          <div className="flex gap-2 mt-2 text-xs flex-wrap">
+            {data?.bySeverity?.critical ? <span className="text-red-400">{data.bySeverity.critical} critical</span> : null}
+            {data?.bySeverity?.high ? <span className="text-orange-400">{data.bySeverity.high} high</span> : null}
+            {data?.bySeverity?.medium ? <span className="text-yellow-400">{data.bySeverity.medium} medium</span> : null}
+          </div>
+        </GlassCard>
+        <GlassCard className="p-4">
+          <div className="text-xs text-zinc-500 mb-1">Last Audit</div>
+          <div className="flex items-center gap-2 mt-2">
+            <Clock className="w-4 h-4 text-zinc-500" />
+            <span className="text-sm text-zinc-300">{data?.timestamp ? formatRelativeTime(data.timestamp) : "Never"}</span>
+          </div>
+        </GlassCard>
+      </div>
+
+      {/* Findings by Category */}
+      {categories.map(cat => {
+        const catFindings = findings.filter(f => f.category === cat);
+        if (catFindings.length === 0) return null;
+        const cfg = CAT_STYLE[cat] || { label: cat, color: "text-zinc-400" };
+        return (
+          <div key={cat} className="mb-6">
+            <div className="flex items-center gap-2 mb-3">
+              <h2 className={`text-sm font-semibold ${cfg.color}`}>{cfg.label}</h2>
+              <span className="text-xs text-zinc-500">({catFindings.length})</span>
+            </div>
+            <div className="space-y-2">
+              {catFindings.map((f, i) => {
+                const sev = SEV_STYLE[f.severity] || SEV_STYLE.info;
+                const globalIdx = findings.indexOf(f);
+                return (
+                  <GlassCard key={i} className={`p-3 border ${sev.bg}`}>
+                    <div className="flex items-start gap-2">
+                      <AlertTriangle className={`w-4 h-4 mt-0.5 shrink-0 ${sev.color}`} />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-1 flex-wrap">
+                          <span className={`text-[10px] font-medium uppercase ${sev.color}`}>{f.severity}</span>
+                          <span className="text-sm font-medium text-zinc-200">{f.summary}</span>
+                        </div>
+                        {f.recommendation && (
+                          <div className="text-xs text-zinc-400 mt-1 space-y-1">
+                            {f.recommendation.split('\n\n').map((line, li) => (
+                              <div key={li}><span className="text-zinc-500">{li === 0 ? '💡 ' : '→ '}</span>{line}</div>
+                            ))}
+                          </div>
+                        )}
+                        {f.evidence && (
+                          <button
+                            onClick={() => setExpandedEvidence(prev => ({ ...prev, [globalIdx]: !prev[globalIdx] }))}
+                            className="text-xs text-zinc-600 mt-1 hover:text-zinc-400 transition-colors"
+                          >
+                            📊 {expandedEvidence[globalIdx] ? 'Hide' : 'Show'} evidence
+                          </button>
+                        )}
+                        {f.evidence && expandedEvidence[globalIdx] && (
+                          <pre className="mt-1 ml-4 whitespace-pre-wrap text-zinc-500 font-mono text-[10px]">{f.evidence}</pre>
+                        )}
+                        {f.impact && f.impact !== 'N/A' && (
+                          <div className="text-xs text-zinc-500 mt-1">
+                            <span className="text-zinc-600">🎯 </span>{f.impact}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </GlassCard>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+
+      {findings.length === 0 && !loading && (
+        <GlassCard className="p-8 text-center">
+          <CheckCircle2 className="w-8 h-8 text-green-400 mx-auto mb-2" />
+          <div className="text-zinc-400">No audit findings yet. Auditor runs automatically.</div>
+        </GlassCard>
+      )}
+    </>
   );
 }
 
